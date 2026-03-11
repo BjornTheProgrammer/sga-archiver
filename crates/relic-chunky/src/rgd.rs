@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    ffi::{CStr, CString},
     io::{self, BufRead, Read, Seek, SeekFrom},
 };
 
@@ -38,19 +37,31 @@ pub enum RelicGameDataError {
     UnknownDataType(i32),
 }
 
-pub enum RGDDataType {
+#[derive(Debug, Clone)]
+pub enum RGDValue {
     Float(f32),
     Int(i32),
     Boolean(bool),
     CString(String),
-    List(Vec<RGDDataType>),
-    List2(Vec<RGDDataType>),
+    List(Vec<RGDEntry>),
+}
+
+#[derive(Debug, Clone)]
+pub struct RGDEntry {
+    pub key_hash: u64,
+    pub value: RGDValue,
+}
+
+#[derive(Debug, Clone)]
+pub struct RGDNode {
+    pub key: String,
+    pub value: RGDValue,
 }
 
 impl RelicGameData {
     pub fn parse<R: Read + BufRead + Seek>(
         chunk_file: &mut ChunkFile<R>,
-    ) -> Result<Self, RelicGameDataError> {
+    ) -> Result<Vec<RGDNode>, RelicGameDataError> {
         let mut keys_chunk_header = None;
         let mut kvs_chunk_header = None;
 
@@ -80,85 +91,67 @@ impl RelicGameData {
             None => return Err(RelicGameDataError::MissingDataAegdChunk),
         };
 
-        let keys = Self::parse_keys(&mut chunk_file.reader, keys_chunk_header);
+        let keys = Self::parse_keys(&mut chunk_file.reader, keys_chunk_header)?;
         println!("keys: {:?}", keys);
 
-        let kvs = Self::parse_aegd(&mut chunk_file.reader, kvs_chunk_header);
-        println!("kvs: {:?}", kvs);
+        let entries = Self::parse_aegd(&mut chunk_file.reader, kvs_chunk_header)?;
+        println!("entries: {:?}", entries);
 
-        // println!("kvs: {:?}", kvs);
-        Ok(Self {})
+        Ok(Self::resolve_nodes(&entries, &keys))
     }
 
-    pub fn read_chunky_list<R: BufRead + Read + Seek>(
+    fn read_chunky_list<R: Read + Seek>(
         reader: &mut R,
-        chunk: &ChunkHeader,
-    ) -> Result<HashMap<u64, String>, RelicGameDataError> {
-        let length = reader.read_u32::<LittleEndian>()?;
+    ) -> Result<Vec<RGDEntry>, RelicGameDataError> {
+        let length = reader.read_u32::<LittleEndian>()? as usize;
 
-        let mut key_type_and_data_index = Vec::<(u64, RGDDataType, i32)>::new();
-
+        let mut index_entries = Vec::with_capacity(length);
         for _ in 0..length {
             let key = reader.read_u64::<LittleEndian>()?;
             let data_type = reader.read_i32::<LittleEndian>()?;
-            let data_index = reader.read_i32::<LittleEndian>()?;
-
-            match data_type {
-                0 => {
-                    let value = reader.read_f32::<LittleEndian>()?;
-                    key_type_and_data_index.push((key, RGDDataType::Float(value), data_index));
-                }
-                1 => {
-                    let value = reader.read_i32::<LittleEndian>()?;
-                    key_type_and_data_index.push((key, RGDDataType::Int(value), data_index));
-                }
-                2 => {
-                    let value = reader.read_u8()?;
-                    key_type_and_data_index.push((
-                        key,
-                        RGDDataType::Boolean(value != 0),
-                        data_index,
-                    ));
-                }
-                3 => {
-                    let mut string_bytes = Vec::new();
-                    reader.read_until(b'\0', &mut string_bytes)?;
-                    let value = CString::new(string_bytes)
-                        .map_err(|e| RelicGameDataError::InvalidDataType(Box::new(e)))?
-                        .into_string()
-                        .map_err(|e| RelicGameDataError::InvalidDataType(Box::new(e)))?;
-
-                    key_type_and_data_index.push((key, RGDDataType::CString(value), data_index));
-                }
-                100 => {
-                    let value = Vec::<RGDDataType>::new();
-                    key_type_and_data_index.push((key, RGDDataType::List(value), data_index));
-                }
-                101 => {
-                    let value = Vec::<RGDDataType>::new();
-                    key_type_and_data_index.push((key, RGDDataType::List2(value), data_index));
-                }
-                _ => {
-                    return Err(RelicGameDataError::UnknownDataType(data_type));
-                }
-            };
+            let data_offset = reader.read_i32::<LittleEndian>()?;
+            index_entries.push((key, data_type, data_offset));
         }
 
-        Ok(())
+        let data_start = reader.stream_position()?;
+
+        let mut entries = Vec::with_capacity(length);
+        for (key, data_type, offset) in index_entries {
+            reader.seek(SeekFrom::Start(data_start + offset as u64))?;
+            let value = match data_type {
+                0 => RGDValue::Float(reader.read_f32::<LittleEndian>()?),
+                1 => RGDValue::Int(reader.read_i32::<LittleEndian>()?),
+                2 => RGDValue::Boolean(reader.read_u8()? != 0),
+                3 => {
+                    let mut bytes = Vec::new();
+                    loop {
+                        let b = reader.read_u8()?;
+                        if b == 0 {
+                            break;
+                        }
+                        bytes.push(b);
+                    }
+                    RGDValue::CString(String::from_utf8_lossy(&bytes).into_owned())
+                }
+                100 | 101 => RGDValue::List(Self::read_chunky_list(reader)?),
+                other => return Err(RelicGameDataError::UnknownDataType(other)),
+            };
+            entries.push(RGDEntry {
+                key_hash: key,
+                value,
+            });
+        }
+
+        Ok(entries)
     }
 
-    pub fn parse_aegd<R: BufRead + Read + Seek>(
+    fn parse_aegd<R: Read + Seek>(
         reader: &mut R,
         chunk: &ChunkHeader,
-    ) -> Result<HashMap<u64, String>, RelicGameDataError> {
-        let key_string_map = HashMap::new();
+    ) -> Result<Vec<RGDEntry>, RelicGameDataError> {
         reader.seek(SeekFrom::Start(chunk.data_position_start))?;
-
-        let unknown = reader.read_u32::<LittleEndian>()?;
-
-        println!("unknown: {:?}", unknown);
-
-        Ok(key_string_map)
+        let _unknown = reader.read_u32::<LittleEndian>()?;
+        Self::read_chunky_list(reader)
     }
 
     pub fn parse_keys<R: Read + Seek>(
@@ -184,5 +177,31 @@ impl RelicGameData {
         }
 
         Ok(key_string_map)
+    }
+
+    fn resolve_nodes(entries: &[RGDEntry], keys: &HashMap<u64, String>) -> Vec<RGDNode> {
+        entries
+            .iter()
+            .map(|entry| {
+                let key = keys
+                    .get(&entry.key_hash)
+                    .cloned()
+                    .unwrap_or_else(|| format!("unknown_{}", entry.key_hash));
+                let value = match &entry.value {
+                    RGDValue::List(children) => {
+                        let resolved: Vec<RGDEntry> = Self::resolve_nodes(children, keys)
+                            .into_iter()
+                            .map(|node| RGDEntry {
+                                key_hash: entry.key_hash,
+                                value: node.value,
+                            })
+                            .collect();
+                        RGDValue::List(resolved)
+                    }
+                    other => other.clone(),
+                };
+                RGDNode { key, value }
+            })
+            .collect()
     }
 }

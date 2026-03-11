@@ -1,5 +1,5 @@
-use std::{ffi::{FromBytesUntilNulError}, io::{self, Read, Seek, SeekFrom}};
 use byteorder::{LittleEndian, ReadBytesExt};
+use std::io::{self, Read, Seek, SeekFrom};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -98,7 +98,6 @@ impl ChunkHeader {
     }
 }
 
-
 #[derive(Debug)]
 pub struct ChunkFile<R: Read + Seek> {
     pub header: ChunkyFileHeader,
@@ -114,18 +113,15 @@ impl<R: Read + Seek> ChunkFile<R> {
         loop {
             match ChunkHeader::parse(&mut reader) {
                 Ok(chunk_header) => {
-                    // skip over the chunk’s payload after recording its start
                     reader.seek(SeekFrom::Start(
                         chunk_header.data_position_start + chunk_header.length as u64,
                     ))?;
                     chunks.push(chunk_header);
                 }
-                Err(DataStoreError::Io(ref e))
-                    if e.kind() == io::ErrorKind::UnexpectedEof =>
-                {
-                    break; // clean EOF, stop parsing
+                Err(DataStoreError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    break;
                 }
-                Err(e) => return Err(e), // propagate real errors
+                Err(e) => return Err(e),
             }
         }
 
@@ -136,10 +132,7 @@ impl<R: Read + Seek> ChunkFile<R> {
         })
     }
 
-    pub fn extract_chunk_data(
-        &mut self,
-        chunk: &ChunkHeader,
-    ) -> Result<Vec<u8>, DataStoreError> {
+    pub fn extract_chunk_data(&mut self, chunk: &ChunkHeader) -> Result<Vec<u8>, DataStoreError> {
         self.reader
             .seek(SeekFrom::Start(chunk.data_position_start))?;
         let mut data = vec![0u8; chunk.length as usize];
