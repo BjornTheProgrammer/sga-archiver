@@ -9,6 +9,7 @@ description = "Cli for sga crate"
 
 [dependencies]
 sga = { version = "0.1.0", path = "../sga" }
+relic-chunky = { version = "0.1.0", path = "../relic-chunky" }
 
 clap = { workspace = true }
 anyhow = { workspace = true }
