@@ -77,19 +77,33 @@ pub enum FileStorageType {
     /// Stored compressed (buffer compression with Brotli).
     BufferCompressBrotli,
 
-    /// Unknown file type
+    /// Encrypted with AES-128 (a high nibble of `1` on the on-disk byte). The
+    /// decryption key is not present in the SGA archive, the game, or any of
+    /// its official tooling, so this crate can identify these files but not
+    /// decrypt them — the underlying compression scheme (the low nibble) is
+    /// unrecoverable without the key anyway, so it isn't retained. See
+    /// `docs/storage-type-18.md` for the full writeup.
+    Aes128Encrypted,
+
+    /// Unknown storage type.
     Unknown(u8),
 }
 
 impl FileStorageType {
-    /// Parses a byte into a `FileStorageType`.
+    /// Parses a byte into a `FileStorageType`. The low nibble is the
+    /// compression scheme; a high nibble of `1` marks the whole byte as
+    /// `Aes128Encrypted`.
     pub fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Store,
-            1 => Self::StreamCompress,
-            2 => Self::BufferCompress,
-            3 => Self::StreamCompressBrotli,
-            4 => Self::BufferCompressBrotli,
+        match value >> 4 {
+            0 => match value {
+                0 => Self::Store,
+                1 => Self::StreamCompress,
+                2 => Self::BufferCompress,
+                3 => Self::StreamCompressBrotli,
+                4 => Self::BufferCompressBrotli,
+                _ => Self::Unknown(value),
+            },
+            1 => Self::Aes128Encrypted,
             _ => Self::Unknown(value),
         }
     }
@@ -101,6 +115,7 @@ impl FileStorageType {
             FileStorageType::BufferCompress => 2,
             FileStorageType::StreamCompressBrotli => 3,
             FileStorageType::BufferCompressBrotli => 4,
+            FileStorageType::Aes128Encrypted => 0x10,
             FileStorageType::Unknown(n) => n,
         }
     }
@@ -145,7 +160,7 @@ impl SgaFileEntry {
         let storage_type_byte = read_field!(reader, SgaFileEntryParseError::FailedToParseByte, u8)?;
         let crc = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
 
-        
+
         let verification_type = FileVerificationType::from_u8(verification_type_byte).map_err(|err| SgaFileEntryParseError::FailedToParseVerificationType(err.to_string()))?;
         let storage_type = FileStorageType::from_u8(storage_type_byte);
 

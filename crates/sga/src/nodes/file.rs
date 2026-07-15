@@ -40,12 +40,16 @@ impl FileNode {
         }
     }
 
-    /// Reads the data from the file and returns it as a vector. 
+    /// Reads the data from the file and returns it as a vector.
+    ///
+    /// `FileStorageType::Aes128Encrypted` files can't actually be decrypted
+    /// by this crate (see `docs/storage-type-18.md`), so the bytes returned
+    /// for them are still ciphertext.
     pub fn read_data<T: Read + Seek>(&self, reader: &mut T) -> Result<Vec<u8>> {
         reader.seek(SeekFrom::Start(self.data_position))?;
 
-        match self.storage_type {
-            FileStorageType::Store | FileStorageType::Unknown(_) => {
+        match &self.storage_type {
+            FileStorageType::Store | FileStorageType::Unknown(_) | FileStorageType::Aes128Encrypted => {
                 let mut data = vec![0u8; self.data_length as usize];
                 reader.read_exact(&mut data)?;
                 Ok(data)
@@ -65,7 +69,7 @@ impl FileNode {
             },
         }
     }
-    
+
     /// Constructs a file node from an SgaFileEntry
     /// Files are always expected to have a parent, that is why it is a required field here
     pub fn from_file_entry<T: Read + BufRead + Seek>(reader: &mut T, entries: &SgaEntries, file_entry: SgaFileEntry, parent: Arc<Mutex<FolderNode>>) -> anyhow::Result<Self> {

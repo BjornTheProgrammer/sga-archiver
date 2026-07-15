@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use relic_chunky::{
     chunky::ChunkFile,
@@ -48,29 +48,33 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    extract_all(cli.input, cli.output.clone())?;
-    decode_rgd_files(&cli.output, cli.rgd_format)?;
+    let written_files = extract_all(cli.input, cli.output)?;
+    decode_rgd_files(&written_files, cli.rgd_format)?;
 
     Ok(())
 }
 
-/// Decodes every .rgd file that was extracted, writing the result next to it.
+/// Decodes every .rgd file among `written_files`, writing the result next to it.
 /// A file that fails to decode is reported but does not fail the extraction.
-fn decode_rgd_files(root: &Path, format: RgdFormat) -> Result<()> {
+fn decode_rgd_files(written_files: &[PathBuf], format: RgdFormat) -> Result<()> {
     let Some(extension) = format.extension() else {
         return Ok(());
     };
 
-    let mut paths = Vec::new();
-    collect_rgd_files(root, &mut paths)
-        .with_context(|| format!("failed to search '{}' for .rgd files", root.display()))?;
+    let rgd_paths: Vec<&PathBuf> = written_files
+        .iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rgd"))
+        })
+        .collect();
 
-    if paths.is_empty() {
+    if rgd_paths.is_empty() {
         return Ok(());
     }
 
     let mut failed = 0;
-    for path in &paths {
+    for path in &rgd_paths {
         if let Err(error) = decode_rgd_file(path, extension) {
             eprintln!("failed to decode '{}': {error:#}", path.display());
             failed += 1;
@@ -79,26 +83,9 @@ fn decode_rgd_files(root: &Path, format: RgdFormat) -> Result<()> {
 
     println!(
         "Decoded {} of {} .rgd files to {extension}",
-        paths.len() - failed,
-        paths.len()
+        rgd_paths.len() - failed,
+        rgd_paths.len()
     );
-
-    Ok(())
-}
-
-fn collect_rgd_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-
-        if path.is_dir() {
-            collect_rgd_files(&path, paths)?;
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("rgd"))
-        {
-            paths.push(path);
-        }
-    }
 
     Ok(())
 }
