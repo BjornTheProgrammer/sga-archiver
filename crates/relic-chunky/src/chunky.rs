@@ -30,14 +30,14 @@ impl ChunkyFileHeader {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChunkType {
     Data,
     Folder,
     Unknown(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChunkHeader {
     pub chunk_type: ChunkType,
     pub name: String,

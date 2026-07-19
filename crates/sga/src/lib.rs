@@ -79,6 +79,14 @@ pub fn write_to_disk<T: Read + Seek, P: AsRef<Path>>(
     Ok(())
 }
 
+/// Reads just the archive header of an sga file. The header's `name` field is
+/// the mod's GUID (as a dash-less hex string), needed to reconstruct the
+/// `.aoe4mod` project file.
+pub fn read_header<P: AsRef<Path>>(sga_file: P) -> Result<entires::SgaHeader> {
+    let mut sga_file = BufReader::new(File::open(sga_file)?);
+    Ok(entires::SgaHeader::parse(&mut sga_file)?)
+}
+
 /// This function extracts all files from the sga into the specified out path,
 /// returning the path of every file that was written.
 pub fn extract_all<P: AsRef<Path>>(sga_file: P, out_path: P) -> Result<Vec<PathBuf>> {

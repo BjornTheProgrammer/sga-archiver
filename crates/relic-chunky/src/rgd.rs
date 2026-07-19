@@ -21,6 +21,9 @@ pub enum RelicGameDataError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
+    #[error("chunk parse error: {0}")]
+    Chunk(#[from] crate::chunky::DataStoreError),
+
     #[error("No DATA KEYS chunk present")]
     MissingDataKeysChunk,
 
@@ -47,6 +50,11 @@ pub enum RGDDataType {
     Int = 1,
     Boolean = 2,
     CString = 3,
+    /// Null-terminated UTF-16LE string. Seen holding loc-string references
+    /// (e.g. `$b5110754a5a76448b8648ef56c1eadc1b:38`), the same `$<hex>:<n>`
+    /// shape as `Loc_FormatText` calls in SCAR. CString (3) is single-byte
+    /// and used for plain identifiers/paths; this is its wide counterpart.
+    LocString = 4,
     List = 100,
     /// A second tag that also encodes a list.
     List2 = 101,
@@ -59,6 +67,7 @@ impl RGDDataType {
             RGDDataType::Int => "Int",
             RGDDataType::Boolean => "Boolean",
             RGDDataType::CString => "CString",
+            RGDDataType::LocString => "LocString",
             RGDDataType::List | RGDDataType::List2 => "List",
         }
     }
@@ -71,6 +80,7 @@ pub enum RGDValue {
     Int(i32),
     Boolean(bool),
     CString(String),
+    LocString(String),
     List(Vec<RGDEntry>),
 }
 
@@ -90,6 +100,7 @@ pub enum RGDNodeValue {
     Int(i32),
     Boolean(bool),
     CString(String),
+    LocString(String),
     List(Vec<RGDNode>),
 }
 
@@ -100,6 +111,7 @@ impl RGDNodeValue {
             RGDNodeValue::Int(_) => RGDDataType::Int,
             RGDNodeValue::Boolean(_) => RGDDataType::Boolean,
             RGDNodeValue::CString(_) => RGDDataType::CString,
+            RGDNodeValue::LocString(_) => RGDDataType::LocString,
             RGDNodeValue::List(_) => RGDDataType::List,
         }
     }
@@ -118,10 +130,15 @@ impl RelicGameData {
     pub fn parse<R: Read + BufRead + Seek>(
         chunk_file: &mut ChunkFile<R>,
     ) -> Result<Vec<RGDNode>, RelicGameDataError> {
+        // KEYS/AEGD are not always top-level: win-condition RDO files (unlike
+        // plain attrib .rgd files) nest them inside a FOLD chunk, so every
+        // FOLD chunk's own children have to be walked too.
+        let all_chunks = Self::flatten_data_chunks(&mut chunk_file.reader, &chunk_file.chunks)?;
+
         let mut keys_chunk_header = None;
         let mut kvs_chunk_header = None;
 
-        for chunk in &chunk_file.chunks {
+        for chunk in &all_chunks {
             if chunk.chunk_type == ChunkType::Data {
                 if chunk.name == "KEYS" {
                     if keys_chunk_header.is_some() {
@@ -151,6 +168,53 @@ impl RelicGameData {
         let entries = Self::parse_aegd(&mut chunk_file.reader, kvs_chunk_header)?;
 
         Ok(Self::resolve_nodes(&entries, &keys))
+    }
+
+    /// Recursively descends into every FOLD chunk in `chunks`, returning a
+    /// flat list of every chunk found (FOLD chunks included, so callers can
+    /// still tell where each DATA chunk came from if needed).
+    pub fn flatten_data_chunks<R: Read + Seek>(
+        reader: &mut R,
+        chunks: &[ChunkHeader],
+    ) -> Result<Vec<ChunkHeader>, RelicGameDataError> {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            if chunk.chunk_type == ChunkType::Folder {
+                let end = chunk.data_position_start + chunk.length as u64;
+                reader.seek(SeekFrom::Start(chunk.data_position_start))?;
+                let children = Self::read_chunk_headers_bounded(reader, end)?;
+                let nested = Self::flatten_data_chunks(reader, &children)?;
+                out.push(chunk.clone());
+                out.extend(nested);
+            } else {
+                out.push(chunk.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reads a sequence of sibling chunk headers starting at the reader's
+    /// current position, stopping once `end` is reached. Mirrors the
+    /// top-level loop in [`ChunkFile::parse`], but bounded to a single FOLD
+    /// chunk's byte range instead of running to EOF.
+    fn read_chunk_headers_bounded<R: Read + Seek>(
+        reader: &mut R,
+        end: u64,
+    ) -> Result<Vec<ChunkHeader>, RelicGameDataError> {
+        let mut chunks = Vec::new();
+        loop {
+            let position = reader.stream_position()?;
+            if position >= end {
+                break;
+            }
+
+            let chunk_header = ChunkHeader::parse(&mut *reader)?;
+            reader.seek(SeekFrom::Start(
+                chunk_header.data_position_start + chunk_header.length as u64,
+            ))?;
+            chunks.push(chunk_header);
+        }
+        Ok(chunks)
     }
 
     fn read_chunky_list<R: Read + Seek>(
@@ -196,8 +260,21 @@ impl RelicGameData {
             1 => RGDValue::Int(reader.read_i32::<LittleEndian>()?),
             2 => RGDValue::Boolean(reader.read_u8()? != 0),
             3 => RGDValue::CString(Self::read_cstring(reader)?),
+            4 => RGDValue::LocString(Self::read_wstring(reader)?),
             100 | 101 => RGDValue::List(Self::read_chunky_list(reader)?),
-            other => return Err(RelicGameDataError::UnknownDataType(other)),
+            other => {
+                if std::env::var_os("RGD_DEBUG_UNKNOWN_TYPE").is_some() {
+                    let position = reader.stream_position()?;
+                    let mut peek = [0u8; 256];
+                    let read = reader.read(&mut peek)?;
+                    reader.seek(SeekFrom::Start(position))?;
+                    eprintln!(
+                        "unknown data type {other} at offset {position}, next {read} bytes: {:02x?}",
+                        &peek[..read]
+                    );
+                }
+                return Err(RelicGameDataError::UnknownDataType(other));
+            }
         })
     }
 
@@ -212,6 +289,20 @@ impl RelicGameData {
         }
 
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Reads a null-terminated UTF-16LE string (data type 4, "LocString").
+    fn read_wstring<R: Read>(reader: &mut R) -> Result<String, RelicGameDataError> {
+        let mut units = Vec::new();
+        loop {
+            let unit = reader.read_u16::<LittleEndian>()?;
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+        }
+
+        Ok(String::from_utf16_lossy(&units))
     }
 
     fn parse_aegd<R: Read + Seek>(
@@ -262,6 +353,7 @@ impl RelicGameData {
                     RGDValue::Int(value) => RGDNodeValue::Int(*value),
                     RGDValue::Boolean(value) => RGDNodeValue::Boolean(*value),
                     RGDValue::CString(value) => RGDNodeValue::CString(value.clone()),
+                    RGDValue::LocString(value) => RGDNodeValue::LocString(value.clone()),
                     RGDValue::List(children) => {
                         RGDNodeValue::List(Self::resolve_nodes(children, keys))
                     }
@@ -310,6 +402,7 @@ pub fn game_data_to_xml(nodes: &[RGDNode]) -> Result<String, quick_xml::Error> {
                     RGDNodeValue::Int(value) => value.to_string(),
                     RGDNodeValue::Boolean(value) => value.to_string(),
                     RGDNodeValue::CString(value) => value.clone(),
+                    RGDNodeValue::LocString(value) => value.clone(),
                     RGDNodeValue::List(_) => unreachable!("handled above"),
                 };
                 element.push_attribute(("Value", text.as_str()));
