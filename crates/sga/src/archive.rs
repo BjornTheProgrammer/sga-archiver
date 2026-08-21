@@ -6,6 +6,8 @@ use anyhow::{anyhow, Result};
 use binrw::{BinRead, BinWrite};
 use brotli::Decompressor;
 use flate2::read::DeflateDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::{Compression, Crc};
 use sha1::{Digest, Sha1};
 
 use crate::entires::{
@@ -339,6 +341,65 @@ impl Archive {
         }
         Ok(written)
     }
+
+    pub fn recompile_from_assets<P: AsRef<Path>>(&mut self, assets_root: P) -> Result<usize> {
+        let mut count = 0;
+        for toc in &mut self.tocs {
+            recompile_folder(&mut toc.root, assets_root.as_ref(), String::new(), &mut count)?;
+        }
+        Ok(count)
+    }
+}
+
+fn encode(data: &[u8], storage: &FileStorageType) -> Result<Vec<u8>> {
+    match storage {
+        FileStorageType::Store | FileStorageType::Unknown(_) => Ok(data.to_vec()),
+        FileStorageType::StreamCompress | FileStorageType::BufferCompress => {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(data)?;
+            Ok(encoder.finish()?)
+        }
+        FileStorageType::StreamCompressBrotli | FileStorageType::BufferCompressBrotli => {
+            Err(anyhow!("Brotli re-compression is not supported"))
+        }
+    }
+}
+
+fn recompile_folder(
+    folder: &mut Folder,
+    assets_root: &Path,
+    path: String,
+    count: &mut usize,
+) -> Result<()> {
+    for file in &mut folder.files {
+        if file.encryption_type != FileEncryptionType::None {
+            continue;
+        }
+        let rel = if path.is_empty() {
+            file.name.clone()
+        } else {
+            format!("{}/{}", path, file.name)
+        };
+        let source = assets_root.join(&rel);
+        if source.is_file() {
+            let data = std::fs::read(&source)?;
+            file.uncompressed_size = data.len() as u32;
+            file.stored_data = encode(&data, &file.storage_type)?;
+            let mut crc = Crc::new();
+            crc.update(&file.stored_data);
+            file.crc = crc.sum();
+            *count += 1;
+        }
+    }
+    for sub in &mut folder.folders {
+        let child_path = if path.is_empty() {
+            sub.name.clone()
+        } else {
+            format!("{}/{}", path, sub.name)
+        };
+        recompile_folder(sub, assets_root, child_path, count)?;
+    }
+    Ok(())
 }
 
 fn intern(value: &str, blob: &mut Vec<u8>, map: &mut HashMap<String, u32>) -> u32 {

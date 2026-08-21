@@ -224,7 +224,7 @@ than `0` or `1` falls back to `Unknown(n)`, as does a low nibble outside
 [`FileNode::read_data`][file-node-rs] recognizes `Aes128Encrypted` explicitly
 and, since the key isn't available, copies the stored bytes verbatim (the
 same as `Store`/`Unknown`) rather than attempting decompression — the
-returned bytes are still ciphertext. `sga-unpacker` reports this distinctly
+returned bytes are still ciphertext. `sga-archiver` reports this distinctly
 at extraction time (`the storage type of '<path>' is AES-128 encrypted,
 which this crate can't decrypt, ...`, with a link to this document) rather
 than lumping it in with the generic "unknown storage type" warning, which is

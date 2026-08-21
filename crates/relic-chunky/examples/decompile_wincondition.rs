@@ -18,7 +18,7 @@ fn main() {
         None => {
             eprintln!(
                 "'{path}' has no RFTY type chunks - it is not a reflection file.\n\
-                 If it is a plain attrib .rgd file, decode it with the sga-unpacker CLI instead."
+                 If it is a plain attrib .rgd file, decode it with the sga-archiver CLI instead."
             );
             std::process::exit(1);
         }

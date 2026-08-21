@@ -30,3 +30,16 @@ pub fn pack_dir<P: AsRef<Path>, Q: AsRef<Path>>(name: &str, dir: P, out_path: Q)
     archive.write(&mut writer)?;
     Ok(())
 }
+
+pub fn compile<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
+    base_sga: P,
+    assets_root: Q,
+    out_path: R,
+) -> Result<usize> {
+    let mut reader = BufReader::new(File::open(base_sga)?);
+    let mut archive = Archive::read(&mut reader)?;
+    let recompiled = archive.recompile_from_assets(assets_root)?;
+    let mut writer = File::create(out_path)?;
+    archive.write(&mut writer)?;
+    Ok(recompiled)
+}

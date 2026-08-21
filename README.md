@@ -1,30 +1,42 @@
-# SGA Unpacker
-A simple cli tool to unpack .sga files from Relic.
+# SGA Archiver
+A CLI tool to pack and unpack `.sga` archives from Relic.
 
 ## Installation
-There are a few options of how to install sga-unpacker, below are listed the ways.
+There are a few options of how to install sga-archiver, below are listed the ways.
 
 ### Cargo
 
-`cargo install sga-unpacker`
+`cargo install sga-archiver`
 
 ### Binary
 
 Click the releases tab, and then download and install the version you wish to use.
 
 ## Usage
-Once installed, all you need to do is run sga-unpacker with an input file and specify an output dir. It then will be unpacked.
+
+### Unpack
+
+Run sga-archiver with an input archive and an output directory. It will be unpacked.
 
 ```
-Usage: sga-unpacker --output <FILE> <INPUT>
+Usage: sga-archiver --output <FILE> <INPUT>
 
 Arguments:
   <INPUT>  Input file path
 
 Options:
-  -o, --output <FILE>  Output folder path
-  -h, --help           Print help
-  -V, --version        Print version
+  -o, --output <FILE>          Output folder path
+      --compile <ASSETS_DIR>   Recompile a mod's source into an archive instead of unpacking
+  -h, --help                   Print help
+  -V, --version                Print version
+```
+
+### Compile
+
+With `--compile <ASSETS_DIR>`, the input is treated as a base archive (a previous build) and the output is a freshly packed archive. Source files found under the assets directory are recompressed into the archive; files with no source (burned artifacts such as textures, attributes, and localization) are carried over from the base build. Hashes are regenerated.
+
+```
+sga-archiver base.sga -o out.sga --compile ./assets
 ```
 
 ## Limitations

@@ -1,11 +1,11 @@
 [package]
-name = "sga-unpacker"
+name = "sga-archiver"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cli for sga crate"
+description = "CLI to pack and unpack Relic '.sga' archives"
 
 [dependencies]
 sga = { version = "0.1.0", path = "../sga" }

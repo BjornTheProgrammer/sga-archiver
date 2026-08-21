@@ -50,10 +50,25 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = ReflectFormat::Text)]
     reflect_format: ReflectFormat,
+
+    #[arg(long, value_name = "ASSETS_DIR")]
+    compile: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(assets) = &cli.compile {
+        let recompiled = sga::compile(&cli.input, assets, &cli.output)?;
+        println!(
+            "Compiled {} into {} (recompiled {} source files)",
+            cli.input.display(),
+            cli.output.display(),
+            recompiled
+        );
+        return Ok(());
+    }
+
     let written_files = extract_all(&cli.input, &cli.output)?;
     decode_rgd_files(&written_files, cli.rgd_format)?;
     decode_reflect_files(&written_files, cli.reflect_format)?;

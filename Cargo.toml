@@ -3,14 +3,14 @@ resolver = "3"
 
 members = ["crates/*"]
 
-default-members = ["crates/sga-unpacker-cli"]
+default-members = ["crates/sga-archiver-cli"]
 
 [workspace.package]
 version = "0.1.2"
 authors = ["Bjorn Beishline"]
 license = "MIT"
 edition = "2024"
-repository = "https://github.com/BjornTheProgrammer/sga-unpacker"
+repository = "https://github.com/BjornTheProgrammer/sga-archiver"
 
 [workspace.dependencies]
 anyhow = "1.0"
