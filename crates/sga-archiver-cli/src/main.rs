@@ -53,10 +53,27 @@ struct Cli {
 
     #[arg(long)]
     compile: bool,
+
+    #[arg(long)]
+    dump_schema: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.dump_schema {
+        let mut registry = relic_chunky::reflect_type::SchemaRegistry::new();
+        let scanned = registry.scan_dir(&cli.input)?;
+        let json = serde_json::to_string_pretty(&registry)?;
+        std::fs::write(&cli.output, json)?;
+        println!(
+            "Scanned {} reflection files, collected {} unique types -> {}",
+            scanned,
+            registry.types.len(),
+            cli.output.display()
+        );
+        return Ok(());
+    }
 
     if cli.compile {
         sga::compile(&cli.input, &cli.output)?;

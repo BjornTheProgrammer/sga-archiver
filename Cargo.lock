@@ -426,6 +426,7 @@ dependencies = [
  "anyhow",
  "clap",
  "relic-chunky",
+ "serde_json",
  "sga",
 ]
 
