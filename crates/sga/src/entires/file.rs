@@ -1,41 +1,17 @@
-use std::io::{BufRead, Read};
+use binrw::binrw;
 
-use sga_macros::read_field;
-use thiserror::Error;
+use crate::utils::{parse_wide, write_wide};
 
-#[derive(Error, Debug)]
-pub enum SgaFileEntryParseError {
-    #[error("Failed to parse number `{0}`")]
-    FailedToParseNumber(String),
-    #[error("Failed to read byte value `{0}`")]
-    FailedToParseByte(String),
-    #[error("Failed to parse storage type `{0}`")]
-    FailedToParseStorageType(String),
-    #[error("Failed to parse verification type `{0}`")]
-    FailedToParseVerificationType(String),
-}
-
-/// Describes how a file is verified when it's loaded.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileVerificationType {
-    /// No verification.
     None,
-
-    /// CRC verification.
     CRC,
-
-    /// CRC verification for blocks.
     CRCBlocks,
-
-    /// MD5 verification for blocks.
     MD5Blocks,
-
-    /// SHA1 verification for blocks.
     SHA1Blocks,
 }
 
 impl FileVerificationType {
-    /// Parses a byte into a `FileVerificationType`.
     pub fn from_u8(value: u8) -> Result<Self, String> {
         match value {
             0 => Ok(Self::None),
@@ -47,8 +23,7 @@ impl FileVerificationType {
         }
     }
 
-    /// Converts the `FileVerificationType` into its corresponding byte value.
-    pub fn to_u8(self) -> u8 {
+    pub fn to_u8(&self) -> u8 {
         match self {
             FileVerificationType::None => 0,
             FileVerificationType::CRC => 1,
@@ -59,25 +34,13 @@ impl FileVerificationType {
     }
 }
 
-/// Describes how a file is stored within an SGA archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileStorageType {
-    /// Stored plainly.
     Store,
-
-    /// Stored compressed (stream compression).
     StreamCompress,
-
-    /// Stored compressed (buffer compression).
     BufferCompress,
-
-    /// Stored compressed (stream compression with Brotli).
     StreamCompressBrotli,
-
-    /// Stored compressed (buffer compression with Brotli).
     BufferCompressBrotli,
-
-    /// Unknown storage type.
     Unknown(u8),
 }
 
@@ -93,14 +56,14 @@ impl FileStorageType {
         }
     }
 
-    pub fn to_u8(self) -> u8 {
+    pub fn to_u8(&self) -> u8 {
         match self {
             FileStorageType::Store => 0,
             FileStorageType::StreamCompress => 1,
             FileStorageType::BufferCompress => 2,
             FileStorageType::StreamCompressBrotli => 3,
             FileStorageType::BufferCompressBrotli => 4,
-            FileStorageType::Unknown(n) => n,
+            FileStorageType::Unknown(n) => *n,
         }
     }
 }
@@ -108,9 +71,7 @@ impl FileStorageType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileEncryptionType {
     None,
-
     Aes128,
-
     Unknown(u8),
 }
 
@@ -123,11 +84,11 @@ impl FileEncryptionType {
         }
     }
 
-    pub fn to_u8(self) -> u8 {
+    pub fn to_u8(&self) -> u8 {
         match self {
             FileEncryptionType::None => 0,
             FileEncryptionType::Aes128 => 1,
-            FileEncryptionType::Unknown(n) => n,
+            FileEncryptionType::Unknown(n) => *n,
         }
     }
 
@@ -136,96 +97,33 @@ impl FileEncryptionType {
     }
 }
 
-/// File entry of an SGA archive.
+#[binrw]
+#[brw(little, import(version: u16))]
 #[derive(Debug, Clone)]
 pub struct SgaFileEntry {
-    /// Offset of the file's name in the SGA archive's string blob.
     pub name_offset: u32,
 
-    /// Offset of the file's hash in the SGA archive's hash blob.
+    #[brw(if(version >= 8))]
     pub hash_offset: u32,
 
-    /// Offset of the file's data in the SGA archive's data blob.
+    #[br(parse_with = parse_wide, args(version))]
+    #[bw(write_with = write_wide, args(version))]
     pub data_offset: u64,
 
-    /// Size of the file in bytes as stored in the SGA archive.
     pub compressed_length: u32,
 
-    /// Size of the file in bytes when uncompressed.
     pub uncompressed_size: u32,
 
-    /// How the file should be verified when loaded.
-    pub verification_type: FileVerificationType,
+    #[brw(if(version >= 4 && version < 10))]
+    pub unknown: u32,
 
-    /// How the file's data is stored.
-    pub storage_type: FileStorageType,
+    pub verification_byte: u8,
 
-    pub encryption_type: FileEncryptionType,
+    pub storage_byte: u8,
 
-    /// CRC32 checksum of the file's data.
+    #[brw(if(version >= 6))]
     pub crc: u32,
-}
 
-impl SgaFileEntry {
-    pub fn parse<T: Read + BufRead>(reader: &mut T, version: u16) -> Result<Self, SgaFileEntryParseError> {
-        let name_offset = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
-
-        let mut hash_offset = 0u32;
-        if version >= 8 {
-            hash_offset = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
-        }
-
-        let data_offset = if version >= 9 {
-            read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u64)?
-        } else {
-            read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)? as u64
-        };
-
-        let compressed_length = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
-        let uncompressed_size = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
-
-        if version >= 4 && version < 10 {
-            let _ = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32);
-        }
-
-        let verification_type = if version >= 7 {
-            let verification_type_byte = read_field!(reader, SgaFileEntryParseError::FailedToParseByte, u8)?;
-            FileVerificationType::from_u8(verification_type_byte)
-                .map_err(|err| SgaFileEntryParseError::FailedToParseVerificationType(err.to_string()))?
-        } else {
-            let _ = read_field!(reader, SgaFileEntryParseError::FailedToParseByte, u8);
-            FileVerificationType::None
-        };
-
-        let storage_type_byte = read_field!(reader, SgaFileEntryParseError::FailedToParseByte, u8)?;
-        let (storage_type, encryption_type) = if version >= 10 {
-            (
-                FileStorageType::from_u8(storage_type_byte & 0x0F),
-                FileEncryptionType::from_u8(storage_type_byte >> 4),
-            )
-        } else {
-            (FileStorageType::from_u8(storage_type_byte), FileEncryptionType::None)
-        };
-
-        let mut crc = 0u32;
-        if version >= 6 {
-            crc = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
-        }
-
-        if version == 7 {
-            hash_offset = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
-        }
-
-        Ok(Self {
-            name_offset,
-            hash_offset,
-            data_offset,
-            compressed_length,
-            uncompressed_size,
-            verification_type,
-            storage_type,
-            encryption_type,
-            crc,
-        })
-    }
+    #[brw(if(version == 7))]
+    pub hash_offset_v7: u32,
 }

@@ -1,68 +1,32 @@
-use std::io::{BufRead, Read};
+use binrw::binrw;
 
-use thiserror::Error;
+use crate::utils::{parse_index, write_index};
 
-use crate::utils::{read_fixed_string, read_index};
-
-/// Table of contents entry of an SGA archive.
+#[binrw]
+#[brw(little, import(version: u16))]
 #[derive(Debug, Clone)]
 pub struct SgaToC {
-    /// Alias of the table of contents.
-    pub alias: String,
+    pub alias: [u8; 64],
 
-    /// Name of the table of contents.
-    pub name: String,
+    pub name: [u8; 64],
 
-    /// Index of the first child folder.
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
     pub folder_start_index: u32,
 
-    /// Index past the last child folder.
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
     pub folder_end_index: u32,
 
-    /// Index of the first child file.
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
     pub file_start_index: u32,
 
-    /// Index past the last child file.
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
     pub file_end_index: u32,
 
-    /// Index of the root folder.
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
     pub folder_root_index: u32,
-}
-
-#[derive(Error, Debug)]
-pub enum SgaTocParseError {
-    #[error("Failed to parse alias: `{0}`")]
-    FailedToParseAlias(String),
-    #[error("Failed to parse name: `{0}`")]
-    FailedToParseName(String),
-    #[error("Failed to parse number: `{0}`")]
-    FailedToParseNumber(String),
-}
-
-impl SgaToC {
-    pub fn parse<T: Read + BufRead>(reader: &mut T, version: u16) -> Result<Self, SgaTocParseError> {
-        let alias = read_fixed_string(reader, 64, 1)
-            .map_err(|err| SgaTocParseError::FailedToParseAlias(err.to_string()))?;
-
-        let name = read_fixed_string(reader, 64, 1)
-            .map_err(|err| SgaTocParseError::FailedToParseName(err.to_string()))?;
-
-        let idx = |reader: &mut T| read_index(reader, version)
-            .map_err(|err| SgaTocParseError::FailedToParseNumber(err.to_string()));
-        let folder_start_index = idx(reader)?;
-        let folder_end_index = idx(reader)?;
-        let file_start_index = idx(reader)?;
-        let file_end_index = idx(reader)?;
-        let folder_root_index = idx(reader)?;
-
-        Ok(Self {
-            alias,
-            name,
-            folder_start_index,
-            folder_end_index,
-            file_start_index,
-            file_end_index,
-            folder_root_index,
-        })
-    }
 }

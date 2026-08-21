@@ -1,51 +1,26 @@
-use std::io::{BufRead, Read};
+use binrw::binrw;
 
-use sga_macros::read_field;
-use thiserror::Error;
+use crate::utils::{parse_index, write_index};
 
-use crate::utils::read_index;
-
-/// Folder entry of an SGA archive.
+#[binrw]
+#[brw(little, import(version: u16))]
 #[derive(Debug, Clone)]
 pub struct SgaFolderEntry {
-    /// Offset of the folder's name in the SGA archive's string blob.
     pub name_offset: u32,
 
-    /// Index of the first child folder.
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
     pub folder_start_index: u32,
 
-    /// Index past the last child folder.
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
     pub folder_end_index: u32,
 
-    /// Index of the first child file.
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
     pub file_start_index: u32,
 
-    /// Index past the last child file.
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
     pub file_end_index: u32,
-}
-
-#[derive(Error, Debug)]
-pub enum SgaFolderEntryParseError {
-    #[error("Failed to read number from stream `{0}`")]
-    FailedToParseNumber(String),
-}
-
-impl SgaFolderEntry {
-    pub fn parse<T: Read + BufRead>(reader: &mut T, version: u16) -> Result<Self, SgaFolderEntryParseError> {
-        let name_offset = read_field!(reader, SgaFolderEntryParseError::FailedToParseNumber, u32)?;
-        let idx = |reader: &mut T| read_index(reader, version)
-            .map_err(|err| SgaFolderEntryParseError::FailedToParseNumber(err.to_string()));
-        let folder_start_index = idx(reader)?;
-        let folder_end_index = idx(reader)?;
-        let file_start_index = idx(reader)?;
-        let file_end_index = idx(reader)?;
-
-        Ok(Self {
-            name_offset,
-            folder_start_index,
-            folder_end_index,
-            file_start_index,
-            file_end_index,
-        })
-    }
 }

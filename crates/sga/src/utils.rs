@@ -1,5 +1,5 @@
-use std::{ffi::CString, io::{self, BufRead, ErrorKind, Read}};
-use anyhow::Result;
+use std::io::{self, ErrorKind, Read};
+use binrw::{BinRead, BinResult, BinWrite};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 pub fn read_index<R: Read>(reader: &mut R, version: u16) -> io::Result<u32> {
@@ -10,14 +10,40 @@ pub fn read_index<R: Read>(reader: &mut R, version: u16) -> io::Result<u32> {
     }
 }
 
-/// Reads a c string from the current position in the buffer.
-pub fn read_c_string<R: Read +  BufRead>(reader: &mut R) -> Result<String> {
-    let mut cstring_vec = vec![];
-    reader.read_until(b'\0', &mut cstring_vec)?;
+#[binrw::parser(reader, endian)]
+pub fn parse_index(version: u16) -> BinResult<u32> {
+    if version < 6 {
+        Ok(u16::read_options(reader, endian, ())? as u32)
+    } else {
+        u32::read_options(reader, endian, ())
+    }
+}
 
-    let parsed_string = CString::from_vec_with_nul(cstring_vec)?.into_string()?;
+#[binrw::writer(writer, endian)]
+pub fn write_index(value: &u32, version: u16) -> BinResult<()> {
+    if version < 6 {
+        (*value as u16).write_options(writer, endian, ())
+    } else {
+        value.write_options(writer, endian, ())
+    }
+}
 
-    Ok(parsed_string)
+#[binrw::parser(reader, endian)]
+pub fn parse_wide(version: u16) -> BinResult<u64> {
+    if version >= 9 {
+        u64::read_options(reader, endian, ())
+    } else {
+        Ok(u32::read_options(reader, endian, ())? as u64)
+    }
+}
+
+#[binrw::writer(writer, endian)]
+pub fn write_wide(value: &u64, version: u16) -> BinResult<()> {
+    if version >= 9 {
+        value.write_options(writer, endian, ())
+    } else {
+        (*value as u32).write_options(writer, endian, ())
+    }
 }
 
 /// Reads a fixed section from the buffer.

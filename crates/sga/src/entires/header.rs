@@ -1,5 +1,6 @@
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 
+use byteorder::{LittleEndian, WriteBytesExt};
 use sga_macros::read_field;
 use thiserror::Error;
 
@@ -230,5 +231,41 @@ impl SgaHeader {
             header_encryption_type,
             signature,
         })
+    }
+
+    pub fn write_main_header<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(&self.magic)?;
+        writer.write_u16::<LittleEndian>(self.version)?;
+        writer.write_u16::<LittleEndian>(self.product)?;
+
+        let mut name_units: Vec<u16> = self.name.encode_utf16().collect();
+        name_units.resize(64, 0);
+        for unit in &name_units[..64] {
+            writer.write_u16::<LittleEndian>(*unit)?;
+        }
+
+        writer.write_u64::<LittleEndian>(self.header_blob_offset)?;
+        writer.write_u32::<LittleEndian>(self.header_blob_length)?;
+        writer.write_u64::<LittleEndian>(self.data_offset)?;
+        writer.write_u64::<LittleEndian>(self.data_blob_length)?;
+        writer.write_u16::<LittleEndian>(1)?;
+        writer.write_u16::<LittleEndian>(self.header_encryption_type.to_u8() as u16)?;
+        writer.write_all(&self.signature)?;
+        Ok(())
+    }
+
+    pub fn write_index_table<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_u32::<LittleEndian>(self.toc_data_offset)?;
+        writer.write_u32::<LittleEndian>(self.toc_data_count)?;
+        writer.write_u32::<LittleEndian>(self.folder_data_offset)?;
+        writer.write_u32::<LittleEndian>(self.folder_data_count)?;
+        writer.write_u32::<LittleEndian>(self.file_data_offset)?;
+        writer.write_u32::<LittleEndian>(self.file_data_count)?;
+        writer.write_u32::<LittleEndian>(self.string_offset)?;
+        writer.write_u32::<LittleEndian>(self.string_length)?;
+        writer.write_u32::<LittleEndian>(self.file_hash_offset)?;
+        writer.write_u32::<LittleEndian>(self.file_hash_length)?;
+        writer.write_u32::<LittleEndian>(self.block_size)?;
+        Ok(())
     }
 }
