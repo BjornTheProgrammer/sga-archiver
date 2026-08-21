@@ -168,6 +168,14 @@ impl SchemaRegistry {
         collect_rfty(&chunky.chunks, &mut self.types);
     }
 
+    pub fn by_hash(&self, hash: u64) -> Option<&TypeDef> {
+        self.types.get(&hash)
+    }
+
+    pub fn by_name(&self, name: &str) -> Option<&TypeDef> {
+        self.types.values().find(|t| t.name == name)
+    }
+
     pub fn scan_reader<R: Read + Seek>(&mut self, reader: &mut R) -> bool {
         match Chunky::read(reader) {
             Ok(chunky) => {
