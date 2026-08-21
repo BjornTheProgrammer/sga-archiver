@@ -414,6 +414,7 @@ dependencies = [
  "brotli",
  "byteorder",
  "flate2",
+ "relic-chunky",
  "sga-macros",
  "sha1",
  "thiserror",

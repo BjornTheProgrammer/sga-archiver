@@ -360,6 +360,7 @@ impl Archive {
                 &assets,
                 Some("scar"),
                 &FileStorageType::BufferCompress,
+                &identity_transform,
             )?;
         }
         let prebuilt_data = source_dir.join("prebuilt").join("data");
@@ -370,6 +371,7 @@ impl Archive {
                 &prebuilt_data,
                 None,
                 &FileStorageType::Store,
+                &identity_transform,
             )?;
         }
         if !folder_is_empty(&data_root) {
@@ -388,7 +390,14 @@ impl Archive {
                     folders: Vec::new(),
                     files: Vec::new(),
                 };
-                add_source_files(&mut root, &base, &base, None, &FileStorageType::Store)?;
+                add_source_files(
+                    &mut root,
+                    &base,
+                    &base,
+                    None,
+                    &FileStorageType::Store,
+                    &identity_transform,
+                )?;
                 if !folder_is_empty(&root) {
                     tocs.push(Toc {
                         alias: alias.to_string(),
@@ -397,6 +406,12 @@ impl Archive {
                     });
                 }
             }
+        }
+
+        // Compile reflection `.rdo` sources into `.bin`s per the burnproj's
+        // ReflectBurner rules, so the mod tree needs no compiled `.bin`.
+        if assets.is_dir() {
+            add_reflection_bins(&mut tocs, &assets)?;
         }
 
         Ok(Archive {
@@ -409,6 +424,222 @@ impl Archive {
             tocs,
         })
     }
+}
+
+/// A `ReflectBurner` rule from a `.burnproj`: which `.rdo` sources (glob
+/// patterns) compile into which TOC (alias).
+struct ReflectRule {
+    alias: String,
+    includes: Vec<String>,
+}
+
+/// Compiles every `.rdo` under `assets` that a `ReflectBurner` rule selects
+/// into a `.bin`, placing it in the rule's TOC. The output path mirrors the
+/// `.rdo`'s location with a lower-cased `.bin` name, matching the editor.
+fn add_reflection_bins(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
+    let Some(burnproj) = find_burnproj(assets) else {
+        return Ok(());
+    };
+    let rules = parse_reflect_rules(&std::fs::read_to_string(&burnproj)?);
+    if rules.is_empty() {
+        return Ok(());
+    }
+
+    let mut stack = vec![assets.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rdo")) {
+                continue;
+            }
+            let rel = path.strip_prefix(assets).unwrap_or(&path).to_path_buf();
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let Some(rule) = rules
+                .iter()
+                .find(|r| r.includes.iter().any(|g| glob_match(g, &rel_str)))
+            else {
+                continue;
+            };
+
+            let rdo_xml = std::fs::read_to_string(&path)?;
+            let bin = relic_chunky::reflect_write::compile_bin(&rdo_xml)
+                .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))?;
+            let out_rel = reflect_output_path(&rel);
+            let file = stored_file(&out_rel, bin);
+            let toc = get_or_create_toc(tocs, &rule.alias);
+            insert_or_replace(&mut toc.root, &out_rel, file);
+        }
+    }
+    Ok(())
+}
+
+fn find_burnproj(assets: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(assets)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("burnproj")))
+}
+
+/// Extracts the `ReflectBurner` rules from a `.burnproj` by lightweight tag
+/// scanning (no XML dependency needed for its simple structure).
+fn parse_reflect_rules(xml: &str) -> Vec<ReflectRule> {
+    let mut rules = Vec::new();
+    for block in xml.split("<BurnRule>").skip(1) {
+        let block = block.split_once("</BurnRule>").map(|(b, _)| b).unwrap_or(block);
+        if tag_value(block, "Burner").as_deref() != Some("ReflectBurner") {
+            continue;
+        }
+        let alias = tag_value(block, "Alias").unwrap_or_default();
+        let includes: Vec<String> = tag_value(block, "Includes")
+            .unwrap_or_default()
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !alias.is_empty() && !includes.is_empty() {
+            rules.push(ReflectRule { alias, includes });
+        }
+    }
+    rules
+}
+
+fn tag_value(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = block.find(&open)? + open.len();
+    let end = block[start..].find(&close)? + start;
+    Some(block[start..end].to_string())
+}
+
+/// The archive path for a compiled `.rdo`: same directory, lower-cased stem,
+/// `.bin` extension.
+fn reflect_output_path(rel: &Path) -> PathBuf {
+    let stem = rel
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mut out = rel.to_path_buf();
+    out.set_file_name(format!("{stem}.bin"));
+    out
+}
+
+fn stored_file(rel: &Path, data: Vec<u8>) -> FileEntry {
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut crc = Crc::new();
+    crc.update(&data);
+    FileEntry {
+        name,
+        uncompressed_size: data.len() as u32,
+        stored_data: data,
+        storage_type: FileStorageType::Store,
+        encryption_type: FileEncryptionType::None,
+        verification_type: FileVerificationType::SHA1Blocks,
+        crc: crc.sum(),
+    }
+}
+
+fn get_or_create_toc<'a>(tocs: &'a mut Vec<Toc>, alias: &str) -> &'a mut Toc {
+    if let Some(idx) = tocs.iter().position(|t| t.alias == alias) {
+        return &mut tocs[idx];
+    }
+    tocs.push(Toc {
+        alias: alias.to_string(),
+        name: alias.to_string(),
+        root: Folder {
+            name: String::new(),
+            folders: Vec::new(),
+            files: Vec::new(),
+        },
+    });
+    tocs.last_mut().unwrap()
+}
+
+/// Inserts `file` at `rel` under `root`, replacing any file already there.
+fn insert_or_replace(root: &mut Folder, rel: &Path, file: FileEntry) {
+    let mut folder = root;
+    if let Some(parent) = rel.parent() {
+        for comp in parent.components() {
+            if let std::path::Component::Normal(os) = comp {
+                let name = os.to_string_lossy().into_owned();
+                let idx = match folder.folders.iter().position(|f| f.name == name) {
+                    Some(i) => i,
+                    None => {
+                        folder.folders.push(Folder {
+                            name,
+                            folders: Vec::new(),
+                            files: Vec::new(),
+                        });
+                        folder.folders.len() - 1
+                    }
+                };
+                folder = &mut folder.folders[idx];
+            }
+        }
+    }
+    match folder.files.iter().position(|f| f.name == file.name) {
+        Some(i) => folder.files[i] = file,
+        None => folder.files.push(file),
+    }
+}
+
+/// Matches a `.burnproj` include glob (with `\` separators, `**` across
+/// directories and `*`/`?` within a segment) against a `/`-separated path.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let pat = pattern.replace('\\', "/");
+    let pat_segs: Vec<&str> = pat.split('/').collect();
+    let path_segs: Vec<&str> = path.split('/').collect();
+    match_segments(&pat_segs, &path_segs)
+}
+
+fn match_segments(pat: &[&str], path: &[&str]) -> bool {
+    match pat.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => (0..=path.len()).any(|i| match_segments(rest, &path[i..])),
+        Some((&head, rest)) => match path.split_first() {
+            Some((seg, tail)) if seg_match(head.as_bytes(), seg.as_bytes()) => {
+                match_segments(rest, tail)
+            }
+            _ => false,
+        },
+    }
+}
+
+/// Case-insensitive wildcard match within one path segment (`*` any run, `?`
+/// one character).
+fn seg_match(pat: &[u8], seg: &[u8]) -> bool {
+    let (mut pi, mut si) = (0, 0);
+    let (mut star, mut mark) = (usize::MAX, 0);
+    while si < seg.len() {
+        if pi < pat.len() && (pat[pi] == b'?' || pat[pi].eq_ignore_ascii_case(&seg[si])) {
+            pi += 1;
+            si += 1;
+        } else if pi < pat.len() && pat[pi] == b'*' {
+            star = pi;
+            mark = si;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 fn read_guid(dir: &Path) -> Result<String> {
@@ -431,12 +662,18 @@ fn folder_is_empty(folder: &Folder) -> bool {
     folder.files.is_empty() && folder.folders.is_empty()
 }
 
+/// The default file transform: pass bytes through unchanged.
+fn identity_transform(_path: &Path, data: Vec<u8>) -> Result<Vec<u8>> {
+    Ok(data)
+}
+
 fn add_source_files(
     root: &mut Folder,
     base: &Path,
     dir: &Path,
     only_ext: Option<&str>,
     storage: &FileStorageType,
+    transform: &dyn Fn(&Path, Vec<u8>) -> Result<Vec<u8>>,
 ) -> Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(|e| e.file_name());
@@ -444,7 +681,7 @@ fn add_source_files(
     for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            add_source_files(root, base, &path, only_ext, storage)?;
+            add_source_files(root, base, &path, only_ext, storage, transform)?;
             continue;
         }
 
@@ -463,7 +700,7 @@ fn add_source_files(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let data = std::fs::read(&path)?;
+        let data = transform(&path, std::fs::read(&path)?)?;
         let stored = encode(&data, storage)?;
         let mut crc = Crc::new();
         crc.update(&stored);

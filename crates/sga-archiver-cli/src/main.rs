@@ -56,6 +56,11 @@ struct Cli {
 
     #[arg(long)]
     dump_schema: bool,
+
+    /// Extract reflection schema resources (`<RootType>.schema`) from the `.bin`
+    /// files under the input directory, into the output directory.
+    #[arg(long)]
+    dump_schema_lib: bool,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +80,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if cli.dump_schema_lib {
+        let count = dump_schema_lib(&cli.input, &cli.output)?;
+        println!("Wrote {count} schema resource(s) -> {}", cli.output.display());
+        return Ok(());
+    }
+
     if cli.compile {
         sga::compile(&cli.input, &cli.output)?;
         println!(
@@ -91,6 +102,42 @@ fn main() -> Result<()> {
     write_aoe4mod(&cli.input, &cli.output, &written_files)?;
 
     Ok(())
+}
+
+/// Walks `input` for reflection `.bin` files and writes one
+/// `<RootType>.schema` resource per distinct root type into `out_dir`.
+fn dump_schema_lib(input: &Path, out_dir: &Path) -> Result<usize> {
+    fs::create_dir_all(out_dir)?;
+    let mut written = 0;
+    let mut stack = vec![input.to_path_buf()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("bin")) {
+                continue;
+            }
+            let bytes = fs::read(&path)?;
+            let Ok((root_type, schema)) = relic_chunky::reflect_write::extract_schema(&bytes) else {
+                continue;
+            };
+            let file_name: String = root_type
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            if seen.insert(file_name.clone()) {
+                fs::write(out_dir.join(format!("{file_name}.schema")), &schema)?;
+                println!("  {} -> {file_name}.schema ({} bytes)", root_type, schema.len());
+                written += 1;
+            }
+        }
+    }
+    Ok(written)
 }
 
 fn write_aoe4mod(input: &Path, output: &Path, written_files: &[PathBuf]) -> Result<()> {

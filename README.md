@@ -36,13 +36,23 @@ Options:
 With `--compile`, the input is a mod source directory and the output is a packed `.sga`. The directory is expected to contain:
 
 - `<mod>.aoe4mod` — the mod project file (its `<ID>` becomes the archive name)
+- `<mod>.burnproj` (under `assets/`) — the editor project; its `ReflectBurner` rules tell the compiler which `.rdo` compile into which TOC
 - `assets/scar/**/*.scar` — Lua source, compressed into the `data` TOC as-is
-- `prebuilt/<toc>/<path>` — pre-burned artifacts that can't be produced from source (textures, attributes, localization), grouped by TOC alias, e.g. `prebuilt/info/mod.rrtex`, `prebuilt/locale/en/en.ucs`, `prebuilt/data/scar/winconditions/<name>.bin`
+- `assets/**/*.rdo` — reflection source (win conditions, mod info, …), the editable source of truth — **no compiled `.bin` needed**
+- `prebuilt/<toc>/<path>` — pre-burned binary assets that genuinely can't be produced from text source (textures, localization), grouped by TOC alias, e.g. `prebuilt/info/mod.rrtex`, `prebuilt/locale/en/en.ucs`
+
+Reflection artifacts are **compiled directly from their `.rdo`** — the mod tree carries no `.bin`. The compiler reads the `.burnproj`'s `ReflectBurner` rules to place each compiled `.rdo` in the right TOC (e.g. `mod.rdo` → `info`, `scar/winconditions/*.rdo` → `data`), naming the output the way the editor does. The invariant engine type schema is bundled in the tool (keyed by root object type), so editing a `.rdo` and rebuilding is all it takes to change win-condition options, labels, and other reflected data — no content editor, no checked-in `.bin`. When a `.rdo` is unchanged the compiled `.bin` is byte-identical to the editor's.
 
 SHA1 hashes are generated and the archive is written unencrypted.
 
 ```
 sga-archiver "./My Mod" -o out.sga --compile
+```
+
+If a mod uses a reflection root type the tool doesn't yet bundle a schema for, regenerate the schema library from any existing `.bin`s and add it to `crates/relic-chunky/schemas/` (plus a match arm in `schema_lib.rs`):
+
+```
+sga-archiver ./some/prebuilt -o ./schemas --dump-schema-lib
 ```
 
 ## Limitations

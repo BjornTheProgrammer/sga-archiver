@@ -1,0 +1,28 @@
+<DataWarehouse>
+	<!--Mod/-->
+	<DataObject Name="Nomad Anonymous" Type="Mod" Id="14004954420306200179" Version="1">
+		<DataProperty Name="m_description" Type="Object">
+			<DataValue Name="util::ReflectLocString">14004954424942201991</DataValue>
+			<!--Mod/util::ReflectLocString/-->
+			<DataObject Name="" Type="util::ReflectLocString" Id="14004954424942201991" OwnerId="14004954420306200179">
+				<DataProperty Name="m_modPart2" Type="UInt32" Value="1837919635"/>
+				<DataProperty Name="m_modPart3" Type="UInt32" Value="2694326283"/>
+				<DataProperty Name="m_modPart0" Type="UInt32" Value="1354613940"/>
+				<DataProperty Name="m_modPart1" Type="UInt32" Value="1200888383"/>
+				<DataProperty Name="m_locStringKey" Type="Int32" Value="2"/>
+			</DataObject>
+		</DataProperty>
+		<DataProperty Name="m_name" Type="Object">
+			<DataValue Name="util::ReflectLocString">14004954423660372099</DataValue>
+			<!--Mod/util::ReflectLocString/-->
+			<DataObject Name="" Type="util::ReflectLocString" Id="14004954423660372099" OwnerId="14004954420306200179">
+				<DataProperty Name="m_modPart2" Type="UInt32" Value="1837919635"/>
+				<DataProperty Name="m_modPart3" Type="UInt32" Value="2694326283"/>
+				<DataProperty Name="m_modPart0" Type="UInt32" Value="1354613940"/>
+				<DataProperty Name="m_modPart1" Type="UInt32" Value="1200888383"/>
+				<DataProperty Name="m_locStringKey" Type="Int32" Value="1"/>
+			</DataObject>
+		</DataProperty>
+	</DataObject>
+</DataWarehouse>
+
