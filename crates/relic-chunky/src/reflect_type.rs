@@ -25,74 +25,101 @@ pub struct TypeDef {
     pub fields: Vec<FieldDef>,
 }
 
-fn u32_at(b: &[u8], o: usize) -> Option<u32> {
-    b.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
-}
-fn u64_at(b: &[u8], o: usize) -> Option<u64> {
-    b.get(o..o + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
-}
-
-fn read_pascal(b: &[u8], o: usize) -> Option<(String, usize)> {
-    let len = u32_at(b, o)? as usize;
-    if len == 0 || len > 256 || o + 4 + len > b.len() {
-        return None;
-    }
-    let s = &b[o + 4..o + 4 + len];
-    if s.iter().all(|&c| (0x20..=0x7e).contains(&c)) {
-        Some((String::from_utf8_lossy(s).into_owned(), o + 4 + len))
-    } else {
-        None
-    }
+/// A forward-only cursor over a chunk payload. Every read advances the
+/// position, so the layout of a chunk is expressed as a sequence of reads
+/// rather than absolute offset arithmetic.
+struct ByteReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
 }
 
-fn is_type_token(s: &str) -> bool {
-    let first = s.chars().next();
-    match first {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
+impl<'a> ByteReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        ByteReader { bytes, pos: 0 }
     }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '<' | '>' | ',' | '*' | ' '))
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let slice = self.bytes.get(self.pos..self.pos + n)?;
+        self.pos += n;
+        Some(slice)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn skip(&mut self, n: usize) -> Option<()> {
+        self.take(n).map(|_| ())
+    }
+
+    /// A length-prefixed ASCII string (`u32` length followed by the bytes).
+    fn pascal(&mut self) -> Option<String> {
+        let len = self.u32()? as usize;
+        if len == 0 || len > 256 {
+            return None;
+        }
+        let raw = self.take(len)?;
+        if raw.iter().all(|&c| (0x20..=0x7e).contains(&c)) {
+            Some(String::from_utf8_lossy(raw).into_owned())
+        } else {
+            None
+        }
+    }
 }
 
-const FIELD_TAIL: usize = 64;
+/// Layout of an `RFTY` payload, read in order:
+///   name (pascal), then a type header, then the field table.
+/// The type header holds the type hash, instance size, and per-type trailer at
+/// fixed positions, followed by a base-class list (`base_count` then that many
+/// 12-byte entries) and a fixed pad before the field count. The field table
+/// (`field_count` records) is already flattened to include inherited fields, so
+/// the bases only need to be skipped, not modelled.
+const AFTER_SIZE_TO_TRAILER: usize = 12;
+const AFTER_TRAILER_TO_BASE_COUNT: usize = 20;
+const BASE_ENTRY_LEN: usize = 12;
+const AFTER_BASES_TO_FIELD_COUNT: usize = 24;
+
+/// Each field record: name (pascal), its hash, the field type name, that type's
+/// hash, the field's byte offset and size, then a fixed trailer.
+const FIELD_TRAILER_LEN: usize = 64;
+
+/// Counts above this mark a non-struct kind (template, enum, pointer) whose
+/// header this parser does not model; such types carry no placeable fields.
+const MAX_COUNT: u64 = 512;
 
 pub fn parse_type(payload: &[u8]) -> Option<TypeDef> {
-    let (name, after_name) = read_pascal(payload, 0)?;
-    let hash = u64_at(payload, after_name)?;
-    let size = u32_at(payload, after_name + 8)?;
-    let trailer = u32_at(payload, after_name + 24).unwrap_or(0);
+    let mut cursor = ByteReader::new(payload);
+    let name = cursor.pascal()?;
+    let hash = cursor.u64()?;
+    let size = cursor.u32()?;
 
+    cursor.skip(AFTER_SIZE_TO_TRAILER)?;
+    let trailer = cursor.u32()?;
+    cursor.skip(AFTER_TRAILER_TO_BASE_COUNT)?;
+
+    let base_count = cursor.u64()?;
+    if base_count > MAX_COUNT {
+        return Some(TypeDef { name, hash, size, trailer, fields: Vec::new() });
+    }
+    cursor.skip(base_count as usize * BASE_ENTRY_LEN)?;
+    cursor.skip(AFTER_BASES_TO_FIELD_COUNT)?;
+
+    let field_count = cursor.u64()?;
     let mut fields = Vec::new();
-    let mut o = after_name + 8;
-    while o + 4 < payload.len() {
-        if let Some((field_name, e)) = read_pascal(payload, o) {
-            if field_name.starts_with("m_") {
-                if let Some(name_hash) = u64_at(payload, e) {
-                    if let Some((type_name, te)) = read_pascal(payload, e + 8) {
-                        if is_type_token(&type_name) && !type_name.starts_with("m_") {
-                            if let (Some(type_hash), Some(offset), Some(fsize)) =
-                                (u64_at(payload, te), u32_at(payload, te + 8), u32_at(payload, te + 12))
-                            {
-                                if offset < size && fsize > 0 && fsize <= size {
-                                    fields.push(FieldDef {
-                                        name: field_name,
-                                        type_name,
-                                        offset,
-                                        size: fsize,
-                                        name_hash,
-                                        type_hash,
-                                    });
-                                    o = te + 16 + FIELD_TAIL;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
+    if field_count <= MAX_COUNT {
+        for _ in 0..field_count {
+            match read_field(&mut cursor, size) {
+                Some(field) => fields.push(field),
+                None => {
+                    fields.clear();
+                    break;
                 }
             }
         }
-        o += 1;
     }
 
     Some(TypeDef {
@@ -101,6 +128,29 @@ pub fn parse_type(payload: &[u8]) -> Option<TypeDef> {
         size,
         trailer,
         fields,
+    })
+}
+
+fn read_field(cursor: &mut ByteReader, type_size: u32) -> Option<FieldDef> {
+    let name = cursor.pascal()?;
+    let name_hash = cursor.u64()?;
+    let type_name = cursor.pascal()?;
+    let type_hash = cursor.u64()?;
+    let offset = cursor.u32()?;
+    let size = cursor.u32()?;
+    cursor.skip(FIELD_TRAILER_LEN)?;
+
+    if !name.starts_with("m_") || offset >= type_size || size == 0 || size > type_size {
+        return None;
+    }
+
+    Some(FieldDef {
+        name,
+        type_name,
+        offset,
+        size,
+        name_hash,
+        type_hash,
     })
 }
 
