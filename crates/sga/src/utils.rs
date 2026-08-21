@@ -1,5 +1,14 @@
 use std::{ffi::CString, io::{self, BufRead, ErrorKind, Read}};
 use anyhow::Result;
+use byteorder::{LittleEndian, ReadBytesExt};
+
+pub fn read_index<R: Read>(reader: &mut R, version: u16) -> io::Result<u32> {
+    if version < 6 {
+        Ok(reader.read_u16::<LittleEndian>()? as u32)
+    } else {
+        reader.read_u32::<LittleEndian>()
+    }
+}
 
 /// Reads a c string from the current position in the buffer.
 pub fn read_c_string<R: Read +  BufRead>(reader: &mut R) -> Result<String> {

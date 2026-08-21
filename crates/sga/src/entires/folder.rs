@@ -3,6 +3,8 @@ use std::io::{BufRead, Read};
 use sga_macros::read_field;
 use thiserror::Error;
 
+use crate::utils::read_index;
+
 /// Folder entry of an SGA archive.
 #[derive(Debug, Clone)]
 pub struct SgaFolderEntry {
@@ -29,12 +31,14 @@ pub enum SgaFolderEntryParseError {
 }
 
 impl SgaFolderEntry {
-    pub fn parse<T: Read + BufRead>(reader: &mut T) -> Result<Self, SgaFolderEntryParseError> {
+    pub fn parse<T: Read + BufRead>(reader: &mut T, version: u16) -> Result<Self, SgaFolderEntryParseError> {
         let name_offset = read_field!(reader, SgaFolderEntryParseError::FailedToParseNumber, u32)?;
-        let folder_start_index = read_field!(reader, SgaFolderEntryParseError::FailedToParseNumber, u32)?;
-        let folder_end_index = read_field!(reader, SgaFolderEntryParseError::FailedToParseNumber, u32)?;
-        let file_start_index = read_field!(reader, SgaFolderEntryParseError::FailedToParseNumber, u32)?;
-        let file_end_index = read_field!(reader, SgaFolderEntryParseError::FailedToParseNumber, u32)?;
+        let idx = |reader: &mut T| read_index(reader, version)
+            .map_err(|err| SgaFolderEntryParseError::FailedToParseNumber(err.to_string()));
+        let folder_start_index = idx(reader)?;
+        let folder_end_index = idx(reader)?;
+        let file_start_index = idx(reader)?;
+        let file_end_index = idx(reader)?;
 
         Ok(Self {
             name_offset,

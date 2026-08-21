@@ -32,7 +32,7 @@ impl SgaEntries {
 
         let mut table_of_contents = Vec::with_capacity(header.toc_data_count as usize);
         for _ in 0..header.toc_data_count {
-            table_of_contents.push(SgaToC::parse(reader)?);
+            table_of_contents.push(SgaToC::parse(reader, header.version)?);
         }
 
 
@@ -42,7 +42,7 @@ impl SgaEntries {
 
         let mut folders = Vec::with_capacity(header.folder_data_count as usize);
         for _ in 0..header.folder_data_count {
-            folders.push(SgaFolderEntry::parse(reader)?);
+            folders.push(SgaFolderEntry::parse(reader, header.version)?);
         }
 
 
@@ -52,7 +52,7 @@ impl SgaEntries {
 
         let mut files = Vec::with_capacity(header.file_data_count as usize);
         for _ in 0..header.file_data_count {
-            files.push(SgaFileEntry::parse(reader)?);
+            files.push(SgaFileEntry::parse(reader, header.version)?);
         }
 
         Ok(Self {

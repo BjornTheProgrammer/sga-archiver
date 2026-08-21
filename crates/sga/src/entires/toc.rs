@@ -1,9 +1,8 @@
 use std::io::{BufRead, Read};
 
-use sga_macros::read_field;
 use thiserror::Error;
 
-use crate::utils::read_fixed_string;
+use crate::utils::{read_fixed_string, read_index};
 
 /// Table of contents entry of an SGA archive.
 #[derive(Debug, Clone)]
@@ -41,18 +40,20 @@ pub enum SgaTocParseError {
 }
 
 impl SgaToC {
-    pub fn parse<T: Read + BufRead>(reader: &mut T) -> Result<Self, SgaTocParseError> {
+    pub fn parse<T: Read + BufRead>(reader: &mut T, version: u16) -> Result<Self, SgaTocParseError> {
         let alias = read_fixed_string(reader, 64, 1)
             .map_err(|err| SgaTocParseError::FailedToParseAlias(err.to_string()))?;
 
         let name = read_fixed_string(reader, 64, 1)
             .map_err(|err| SgaTocParseError::FailedToParseName(err.to_string()))?;
 
-        let folder_start_index = read_field!(reader, SgaTocParseError::FailedToParseNumber, u32)?;
-        let folder_end_index = read_field!(reader, SgaTocParseError::FailedToParseNumber, u32)?;
-        let file_start_index = read_field!(reader, SgaTocParseError::FailedToParseNumber, u32)?;
-        let file_end_index = read_field!(reader, SgaTocParseError::FailedToParseNumber, u32)?;
-        let folder_root_index = read_field!(reader, SgaTocParseError::FailedToParseNumber, u32)?;
+        let idx = |reader: &mut T| read_index(reader, version)
+            .map_err(|err| SgaTocParseError::FailedToParseNumber(err.to_string()));
+        let folder_start_index = idx(reader)?;
+        let folder_end_index = idx(reader)?;
+        let file_start_index = idx(reader)?;
+        let file_end_index = idx(reader)?;
+        let folder_root_index = idx(reader)?;
 
         Ok(Self {
             alias,

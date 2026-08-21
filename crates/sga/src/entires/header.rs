@@ -3,7 +3,7 @@ use std::io::{BufRead, Read, Seek, SeekFrom};
 use sga_macros::read_field;
 use thiserror::Error;
 
-use crate::utils::read_fixed_string;
+use crate::{entires::FileEncryptionType, utils::{read_fixed_string, read_index}};
 
 /// Header of an SGA archive.
 #[derive(Debug, Clone)]
@@ -59,6 +59,8 @@ pub struct SgaHeader {
     /// Block size of the archive.
     pub block_size: u32,
 
+    pub header_encryption_type: FileEncryptionType,
+
     /// 2048-bit (256 byte) signature of the archive.
     /// Probably using PKCS#1 in official archives.
     /// Also validated in the game by XORing together 16 byte chunks and comparing against known values.
@@ -83,6 +85,8 @@ pub enum SgaHeaderParseError {
     SignatureValueImproper(String),
     #[error("Failed to seek position from stream: `{0}`")]
     SeekError(String),
+    #[error("Unsupported SGA archive version `{0}` (this crate reads versions 3 through 11)")]
+    UnsupportedVersion(u16),
 }
 
 impl SgaHeader {
@@ -104,44 +108,104 @@ impl SgaHeader {
         let version = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u16)?;
         let product = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u16)?;
 
-        let name = 
+        if version < 3 || version > 11 {
+            return Err(SgaHeaderParseError::UnsupportedVersion(version));
+        }
+
+        if version < 6 {
+            reader.seek_relative(16).map_err(|err| SgaHeaderParseError::SeekError(err.to_string()))?;
+        }
+
+        let name =
             read_fixed_string(reader, 64, 2)
                 .map_err(|err| SgaHeaderParseError::FailedToName(err.to_string()))?;
 
-        let header_blob_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u64)?;
-        let header_blob_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        let data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u64)?;
-        let data_blob_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u64)?;
+        if version < 6 {
+            reader.seek_relative(16).map_err(|err| SgaHeaderParseError::SeekError(err.to_string()))?;
+        }
 
-        let _ = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32); // Always 1
+        let mut header_blob_offset: Option<u64> = if version >= 9 {
+            Some(read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u64)?)
+        } else if version >= 8 {
+            Some(read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)? as u64)
+        } else {
+            None
+        };
+
+        let header_blob_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
+
+        let data_offset;
+        let mut data_blob_length: u64 = 0;
+        if version >= 9 {
+            data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u64)?;
+            data_blob_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u64)?;
+        } else if version == 5 {
+            data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)? as u64;
+            header_blob_offset = Some(read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)? as u64);
+        } else {
+            data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)? as u64;
+            if version >= 8 {
+                data_blob_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)? as u64;
+            }
+        }
+
+        let mut header_encryption_type = FileEncryptionType::None;
+        if version >= 11 {
+            let _ = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u16); // Always 1
+            let header_encryption_byte = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u16)?;
+            header_encryption_type = FileEncryptionType::from_u8(header_encryption_byte as u8);
+        } else {
+            let _ = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32);
+        }
+
+        if version == 5 {
+            let _ = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32);
+            let _ = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32);
+        }
 
         let mut signature = [0u8; 256];
-        reader.read_exact(&mut signature).map_err(|_| {
-            SgaHeaderParseError::SignatureValueImproper(
-                "Failed to read 256 bytes for signature".to_string(),
-            )
-        })?;
+        if version >= 8 {
+            reader.read_exact(&mut signature).map_err(|_| {
+                SgaHeaderParseError::SignatureValueImproper(
+                    "Failed to read 256 bytes for signature".to_string(),
+                )
+            })?;
+        }
+
+        let header_blob_offset = match header_blob_offset {
+            Some(offset) => offset,
+            None => reader.stream_position().map_err(|err| SgaHeaderParseError::SeekError(err.to_string()))?,
+        };
 
         reader.seek(SeekFrom::Start(header_blob_offset)).map_err(|err| SgaHeaderParseError::SeekError(err.to_string()))?;
 
         // BaseStream.Seek((long)blobOffset, SeekOrigin.Begin);
 
+        let index = |reader: &mut T| read_index(reader, version)
+            .map_err(|err| SgaHeaderParseError::FailedToParseNumber(err.to_string()));
+
         let toc_data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        let toc_data_count = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
+        let toc_data_count = index(reader)?;
 
         let folder_data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        let folder_data_count = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
+        let folder_data_count = index(reader)?;
 
         let file_data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        let file_data_count = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
+        let file_data_count = index(reader)?;
 
         let string_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        let string_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
+        let string_length = index(reader)?;
 
-        let file_hash_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        let file_hash_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-
-        let block_size = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
+        let mut file_hash_offset = 0u32;
+        let mut file_hash_length = 0u32;
+        let mut block_size = 0u32;
+        if version >= 7 {
+            file_hash_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
+            if version >= 8 {
+                file_hash_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
+            }
+            block_size = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
+        }
 
         Ok(Self {
             magic,
@@ -163,6 +227,7 @@ impl SgaHeader {
             file_hash_offset,
             file_hash_length,
             block_size,
+            header_encryption_type,
             signature,
         })
     }

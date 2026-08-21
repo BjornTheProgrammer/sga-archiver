@@ -95,6 +95,7 @@ impl FolderNode {
                 file_entry.compressed_length as usize,
                 file_entry.uncompressed_size as usize,
                 file_entry.storage_type.clone(),
+                file_entry.encryption_type.clone(),
                 this.clone(),
             );
 

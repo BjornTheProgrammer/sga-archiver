@@ -43,20 +43,14 @@ pub enum RelicGameDataError {
     InvalidDataOffset { key: u64, offset: i32 },
 }
 
-/// Data type of a DATA AEGD chunk entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RGDDataType {
     Float = 0,
     Int = 1,
     Boolean = 2,
     CString = 3,
-    /// Null-terminated UTF-16LE string. Seen holding loc-string references
-    /// (e.g. `$b5110754a5a76448b8648ef56c1eadc1b:38`), the same `$<hex>:<n>`
-    /// shape as `Loc_FormatText` calls in SCAR. CString (3) is single-byte
-    /// and used for plain identifiers/paths; this is its wide counterpart.
     LocString = 4,
     List = 100,
-    /// A second tag that also encodes a list.
     List2 = 101,
 }
 
@@ -73,7 +67,6 @@ impl RGDDataType {
     }
 }
 
-/// Value of a DATA AEGD entry, with its keys still stored as hashes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RGDValue {
     Float(f32),
@@ -84,15 +77,12 @@ pub enum RGDValue {
     List(Vec<RGDEntry>),
 }
 
-/// Entry of a DATA AEGD chunk. The key's string representation can be found in
-/// the DATA KEYS chunk; use [`RelicGameData::resolve_nodes`] to resolve it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RGDEntry {
     pub key_hash: u64,
     pub value: RGDValue,
 }
 
-/// Value of an [`RGDNode`], with its keys resolved against the DATA KEYS chunk.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum RGDNodeValue {
@@ -117,7 +107,6 @@ impl RGDNodeValue {
     }
 }
 
-/// Key-value node found in DATA AEGD chunks of Relic Game Data (RGD) files.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RGDNode {
     pub key: String,
@@ -125,14 +114,9 @@ pub struct RGDNode {
 }
 
 impl RelicGameData {
-    /// Reads the nodes of a Relic Game Data (RGD) file, with every key resolved
-    /// against the file's DATA KEYS chunk.
     pub fn parse<R: Read + BufRead + Seek>(
         chunk_file: &mut ChunkFile<R>,
     ) -> Result<Vec<RGDNode>, RelicGameDataError> {
-        // KEYS/AEGD are not always top-level: win-condition RDO files (unlike
-        // plain attrib .rgd files) nest them inside a FOLD chunk, so every
-        // FOLD chunk's own children have to be walked too.
         let all_chunks = Self::flatten_data_chunks(&mut chunk_file.reader, &chunk_file.chunks)?;
 
         let mut keys_chunk_header = None;
@@ -170,9 +154,6 @@ impl RelicGameData {
         Ok(Self::resolve_nodes(&entries, &keys))
     }
 
-    /// Recursively descends into every FOLD chunk in `chunks`, returning a
-    /// flat list of every chunk found (FOLD chunks included, so callers can
-    /// still tell where each DATA chunk came from if needed).
     pub fn flatten_data_chunks<R: Read + Seek>(
         reader: &mut R,
         chunks: &[ChunkHeader],
@@ -193,10 +174,6 @@ impl RelicGameData {
         Ok(out)
     }
 
-    /// Reads a sequence of sibling chunk headers starting at the reader's
-    /// current position, stopping once `end` is reached. Mirrors the
-    /// top-level loop in [`ChunkFile::parse`], but bounded to a single FOLD
-    /// chunk's byte range instead of running to EOF.
     fn read_chunk_headers_bounded<R: Read + Seek>(
         reader: &mut R,
         end: u64,
@@ -222,8 +199,6 @@ impl RelicGameData {
     ) -> Result<Vec<RGDEntry>, RelicGameDataError> {
         let length = reader.read_u32::<LittleEndian>()? as usize;
 
-        // `length` is read straight from the file, so only reserve a sane amount
-        // up front. A truncated or corrupt list fails on read below instead.
         let mut index_entries = Vec::with_capacity(length.min(1024));
         for _ in 0..length {
             let key = reader.read_u64::<LittleEndian>()?;
@@ -232,7 +207,6 @@ impl RelicGameData {
             index_entries.push((key, data_type, data_offset));
         }
 
-        // Entry offsets are relative to the end of the index.
         let data_start = reader.stream_position()?;
 
         let mut entries = Vec::with_capacity(index_entries.len());
@@ -291,7 +265,6 @@ impl RelicGameData {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Reads a null-terminated UTF-16LE string (data type 4, "LocString").
     fn read_wstring<R: Read>(reader: &mut R) -> Result<String, RelicGameDataError> {
         let mut units = Vec::new();
         loop {
@@ -333,16 +306,12 @@ impl RelicGameData {
                 String::from_utf8_lossy(&string_bytes).to_string()
             };
 
-            // The first string wins if a hash is listed more than once.
             key_string_map.entry(key).or_insert(string);
         }
 
         Ok(key_string_map)
     }
 
-    /// Resolves the key hash of every entry, recursively, against the DATA KEYS
-    /// chunk. Each entry keeps its own key: a list's children are resolved with
-    /// their own hashes, not the hash of the list they sit in.
     pub fn resolve_nodes(entries: &[RGDEntry], keys: &HashMap<u64, String>) -> Vec<RGDNode> {
         entries
             .iter()
@@ -362,8 +331,6 @@ impl RelicGameData {
             .collect()
     }
 
-    /// Keys that are not present in the DATA KEYS chunk are kept as their raw
-    /// hash so no data is silently dropped.
     fn resolve_key(key: u64, keys: &HashMap<u64, String>) -> String {
         keys.get(&key)
             .cloned()
@@ -371,7 +338,6 @@ impl RelicGameData {
     }
 }
 
-/// Encodes RGD nodes as a JSON string.
 pub fn game_data_to_json(nodes: &[RGDNode]) -> Result<String, serde_json::Error> {
     #[derive(Serialize)]
     struct Root<'a> {
@@ -381,7 +347,6 @@ pub fn game_data_to_json(nodes: &[RGDNode]) -> Result<String, serde_json::Error>
     serde_json::to_string_pretty(&Root { data: nodes })
 }
 
-/// Encodes RGD nodes as an XML string.
 pub fn game_data_to_xml(nodes: &[RGDNode]) -> Result<String, quick_xml::Error> {
     fn write_node(writer: &mut Writer<Vec<u8>>, node: &RGDNode) -> Result<(), quick_xml::Error> {
         let mut element = BytesStart::new("RGDNode");
@@ -421,6 +386,5 @@ pub fn game_data_to_xml(nodes: &[RGDNode]) -> Result<String, quick_xml::Error> {
     }
     writer.write_event(Event::End(BytesEnd::new("Root")))?;
 
-    // quick-xml only ever writes UTF-8, so this cannot fail.
     Ok(String::from_utf8(writer.into_inner()).expect("quick-xml emits UTF-8"))
 }

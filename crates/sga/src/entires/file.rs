@@ -60,7 +60,7 @@ impl FileVerificationType {
 }
 
 /// Describes how a file is stored within an SGA archive.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileStorageType {
     /// Stored plainly.
     Store,
@@ -77,33 +77,18 @@ pub enum FileStorageType {
     /// Stored compressed (buffer compression with Brotli).
     BufferCompressBrotli,
 
-    /// Encrypted with AES-128 (a high nibble of `1` on the on-disk byte). The
-    /// decryption key is not present in the SGA archive, the game, or any of
-    /// its official tooling, so this crate can identify these files but not
-    /// decrypt them — the underlying compression scheme (the low nibble) is
-    /// unrecoverable without the key anyway, so it isn't retained. See
-    /// `docs/storage-type-18.md` for the full writeup.
-    Aes128Encrypted,
-
     /// Unknown storage type.
     Unknown(u8),
 }
 
 impl FileStorageType {
-    /// Parses a byte into a `FileStorageType`. The low nibble is the
-    /// compression scheme; a high nibble of `1` marks the whole byte as
-    /// `Aes128Encrypted`.
     pub fn from_u8(value: u8) -> Self {
-        match value >> 4 {
-            0 => match value {
-                0 => Self::Store,
-                1 => Self::StreamCompress,
-                2 => Self::BufferCompress,
-                3 => Self::StreamCompressBrotli,
-                4 => Self::BufferCompressBrotli,
-                _ => Self::Unknown(value),
-            },
-            1 => Self::Aes128Encrypted,
+        match value {
+            0 => Self::Store,
+            1 => Self::StreamCompress,
+            2 => Self::BufferCompress,
+            3 => Self::StreamCompressBrotli,
+            4 => Self::BufferCompressBrotli,
             _ => Self::Unknown(value),
         }
     }
@@ -115,9 +100,39 @@ impl FileStorageType {
             FileStorageType::BufferCompress => 2,
             FileStorageType::StreamCompressBrotli => 3,
             FileStorageType::BufferCompressBrotli => 4,
-            FileStorageType::Aes128Encrypted => 0x10,
             FileStorageType::Unknown(n) => n,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileEncryptionType {
+    None,
+
+    Aes128,
+
+    Unknown(u8),
+}
+
+impl FileEncryptionType {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::None,
+            1 => Self::Aes128,
+            _ => Self::Unknown(value),
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            FileEncryptionType::None => 0,
+            FileEncryptionType::Aes128 => 1,
+            FileEncryptionType::Unknown(n) => n,
+        }
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        !matches!(self, FileEncryptionType::None)
     }
 }
 
@@ -145,24 +160,61 @@ pub struct SgaFileEntry {
     /// How the file's data is stored.
     pub storage_type: FileStorageType,
 
+    pub encryption_type: FileEncryptionType,
+
     /// CRC32 checksum of the file's data.
     pub crc: u32,
 }
 
 impl SgaFileEntry {
-    pub fn parse<T: Read + BufRead>(reader: &mut T) -> Result<Self, SgaFileEntryParseError> {
+    pub fn parse<T: Read + BufRead>(reader: &mut T, version: u16) -> Result<Self, SgaFileEntryParseError> {
         let name_offset = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
-        let hash_offset = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
-        let data_offset = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u64)?;
+
+        let mut hash_offset = 0u32;
+        if version >= 8 {
+            hash_offset = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
+        }
+
+        let data_offset = if version >= 9 {
+            read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u64)?
+        } else {
+            read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)? as u64
+        };
+
         let compressed_length = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
         let uncompressed_size = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
-        let verification_type_byte = read_field!(reader, SgaFileEntryParseError::FailedToParseByte, u8)?;
+
+        if version >= 4 && version < 10 {
+            let _ = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32);
+        }
+
+        let verification_type = if version >= 7 {
+            let verification_type_byte = read_field!(reader, SgaFileEntryParseError::FailedToParseByte, u8)?;
+            FileVerificationType::from_u8(verification_type_byte)
+                .map_err(|err| SgaFileEntryParseError::FailedToParseVerificationType(err.to_string()))?
+        } else {
+            let _ = read_field!(reader, SgaFileEntryParseError::FailedToParseByte, u8);
+            FileVerificationType::None
+        };
+
         let storage_type_byte = read_field!(reader, SgaFileEntryParseError::FailedToParseByte, u8)?;
-        let crc = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
+        let (storage_type, encryption_type) = if version >= 10 {
+            (
+                FileStorageType::from_u8(storage_type_byte & 0x0F),
+                FileEncryptionType::from_u8(storage_type_byte >> 4),
+            )
+        } else {
+            (FileStorageType::from_u8(storage_type_byte), FileEncryptionType::None)
+        };
 
+        let mut crc = 0u32;
+        if version >= 6 {
+            crc = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
+        }
 
-        let verification_type = FileVerificationType::from_u8(verification_type_byte).map_err(|err| SgaFileEntryParseError::FailedToParseVerificationType(err.to_string()))?;
-        let storage_type = FileStorageType::from_u8(storage_type_byte);
+        if version == 7 {
+            hash_offset = read_field!(reader, SgaFileEntryParseError::FailedToParseNumber, u32)?;
+        }
 
         Ok(Self {
             name_offset,
@@ -172,6 +224,7 @@ impl SgaFileEntry {
             uncompressed_size,
             verification_type,
             storage_type,
+            encryption_type,
             crc,
         })
     }

@@ -14,12 +14,10 @@ use relic_chunky::{
 };
 use sga::{extract_all, read_header};
 
-/// Format to decode extracted .rgd files into.
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum RgdFormat {
     Xml,
     Json,
-    /// Leave .rgd files as they are.
     None,
 }
 
@@ -33,31 +31,23 @@ impl RgdFormat {
     }
 }
 
-/// Whether to decompile reflection files (win-condition .rdo/.bin) into a
-/// readable .txt report alongside them.
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum ReflectFormat {
-    /// Write a human-readable .txt report next to each reflection file.
     Text,
-    /// Leave reflection files as they are.
     None,
 }
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Input file path
     input: PathBuf,
 
-    /// Output folder path
     #[arg(short, long, value_name = "FILE")]
     output: PathBuf,
 
-    /// Format to decode extracted .rgd files into, written alongside the .rgd
     #[arg(long, value_enum, default_value_t = RgdFormat::Xml)]
     rgd_format: RgdFormat,
 
-    /// Whether to decompile reflection files (win-condition .rdo/.bin) to .txt
     #[arg(long, value_enum, default_value_t = ReflectFormat::Text)]
     reflect_format: ReflectFormat,
 }
@@ -72,19 +62,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Reconstructs the `<ModName>.aoe4mod` Content Editor project file at the
-/// root of the extracted output, so a packed mod can be re-opened as an
-/// editable project. Every field is recoverable from the archive:
-///   * the mod GUID is the sga header's `name` field (a dash-less hex string),
-///   * the loc-db path and the mod's display name come from the extracted
-///     `locdb\*.locdb` file,
-///   * the data/intermediate paths are the editor's fixed conventions.
 fn write_aoe4mod(input: &Path, output: &Path, written_files: &[PathBuf]) -> Result<()> {
     let header = read_header(input)?;
     let guid = format_guid(&header.name);
 
-    // The .locdb path (relative to the assets dir) doubles as the source of
-    // the mod's display name (its file stem). Falls back to the archive name.
     let locdb = written_files
         .iter()
         .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("locdb")));
@@ -96,7 +77,6 @@ fn write_aoe4mod(input: &Path, output: &Path, written_files: &[PathBuf]) -> Resu
                 .and_then(|s| s.to_str())
                 .unwrap_or(&header.name)
                 .to_string();
-            // Editor stores this relative to the mod root, e.g. `locdb\Foo.locdb`.
             let rel = path
                 .strip_prefix(output)
                 .unwrap_or(path)
@@ -126,8 +106,6 @@ fn write_aoe4mod(input: &Path, output: &Path, written_files: &[PathBuf]) -> Resu
     Ok(())
 }
 
-/// Formats a 32-char dash-less hex GUID as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
-/// Returns the input unchanged if it is not exactly 32 hex characters.
 fn format_guid(raw: &str) -> String {
     if raw.len() == 32 && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
         format!(
@@ -143,17 +121,11 @@ fn format_guid(raw: &str) -> String {
     }
 }
 
-/// Decompiles every reflection file (win-condition .rdo/.bin) among
-/// `written_files` into a readable .txt report written next to it. Files that
-/// are not reflection files (no RFTY chunks) are skipped silently; a file that
-/// errors is reported but does not fail the extraction.
 fn decode_reflect_files(written_files: &[PathBuf], format: ReflectFormat) -> Result<()> {
     if format == ReflectFormat::None {
         return Ok(());
     }
 
-    // Only .rdo/.bin can be reflection files; probing every extracted file
-    // would waste work opening textures, scripts, etc.
     let candidates: Vec<&PathBuf> = written_files
         .iter()
         .filter(|path| {
@@ -179,22 +151,16 @@ fn decode_reflect_files(written_files: &[PathBuf], format: ReflectFormat) -> Res
     Ok(())
 }
 
-/// Attempts to decompile one file as a reflection file. Returns `Ok(true)` if
-/// it was a reflection file and a report was written, `Ok(false)` if it was
-/// not a reflection file (nothing written).
 fn decode_reflect_file(path: &Path) -> Result<bool> {
     let file = fs::File::open(path)?;
     let mut chunk_file = match ChunkFile::parse(BufReader::new(file)) {
         Ok(chunk_file) => chunk_file,
-        // Not a chunky file at all (many .bin files are not): skip quietly.
         Err(_) => return Ok(false),
     };
 
     match ReflectFile::parse(&mut chunk_file) {
         Some(reflect) => {
-            // Readable summary report...
             fs::write(path.with_extension("txt"), reflect.to_report())?;
-            // ...and the editor-source .rdo reconstruction.
             let file = fs::File::open(path)?;
             let mut chunk_file = ChunkFile::parse(BufReader::new(file))?;
             if let Some(decompiled) = DecompiledReflect::parse(&mut chunk_file) {
@@ -206,8 +172,6 @@ fn decode_reflect_file(path: &Path) -> Result<bool> {
     }
 }
 
-/// Decodes every .rgd file among `written_files`, writing the result next to it.
-/// A file that fails to decode is reported but does not fail the extraction.
 fn decode_rgd_files(written_files: &[PathBuf], format: RgdFormat) -> Result<()> {
     let Some(extension) = format.extension() else {
         return Ok(());

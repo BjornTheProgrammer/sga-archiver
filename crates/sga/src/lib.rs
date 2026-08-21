@@ -54,17 +54,13 @@ pub fn write_to_disk<T: Read + Seek, P: AsRef<Path>>(
                 let data = file_node.read_data(reader)?;
                 let file_path = folder_path.join(&file_node.name);
 
-                match &file_node.storage_type {
-                    FileStorageType::Aes128Encrypted => {
-                        println!(
-                            "The storage type of '{:?}' is AES-128 encrypted, which this crate can't decrypt, it will be unpacked as raw (still encrypted) bytes! See https://github.com/BjornTheProgrammer/sga-unpacker/blob/master/crates/sga/docs/storage-type-18.md",
-                            file_path
-                        );
-                    }
-                    FileStorageType::Unknown(n) => {
-                        println!("The storage type of '{:?}' is unknown with value of '{}', it will be unpacked as raw bytes!", file_path, n);
-                    }
-                    _ => {}
+                if file_node.encryption_type.is_encrypted() {
+                    println!(
+                        "The data of '{:?}' is {:?} encrypted, which this crate can't decrypt, it will be unpacked as raw (still encrypted) bytes! See https://github.com/BjornTheProgrammer/sga-unpacker/blob/master/crates/sga/docs/storage-type-18.md",
+                        file_path, file_node.encryption_type
+                    );
+                } else if let FileStorageType::Unknown(n) = &file_node.storage_type {
+                    println!("The storage type of '{:?}' is unknown with value of '{}', it will be unpacked as raw bytes!", file_path, n);
                 }
 
                 fs::write(&file_path, &data)?;
@@ -79,9 +75,6 @@ pub fn write_to_disk<T: Read + Seek, P: AsRef<Path>>(
     Ok(())
 }
 
-/// Reads just the archive header of an sga file. The header's `name` field is
-/// the mod's GUID (as a dash-less hex string), needed to reconstruct the
-/// `.aoe4mod` project file.
 pub fn read_header<P: AsRef<Path>>(sga_file: P) -> Result<entires::SgaHeader> {
     let mut sga_file = BufReader::new(File::open(sga_file)?);
     Ok(entires::SgaHeader::parse(&mut sga_file)?)
@@ -107,7 +100,6 @@ pub fn extract_all<P: AsRef<Path>>(sga_file: P, out_path: P) -> Result<Vec<PathB
 
     Ok(written_files)
 }
-
 
 /// This function extracts all files from the sga into the specified out path,
 /// returning the path of every file that was written.
