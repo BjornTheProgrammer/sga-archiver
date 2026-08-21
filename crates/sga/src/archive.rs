@@ -342,13 +342,169 @@ impl Archive {
         Ok(written)
     }
 
-    pub fn recompile_from_assets<P: AsRef<Path>>(&mut self, assets_root: P) -> Result<usize> {
-        let mut count = 0;
-        for toc in &mut self.tocs {
-            recompile_folder(&mut toc.root, assets_root.as_ref(), String::new(), &mut count)?;
+    pub fn compile_project<P: AsRef<Path>>(source_dir: P) -> Result<Archive> {
+        let source_dir = source_dir.as_ref();
+        let name = read_guid(source_dir)?;
+        let mut tocs = Vec::new();
+
+        let mut data_root = Folder {
+            name: String::new(),
+            folders: Vec::new(),
+            files: Vec::new(),
+        };
+        let assets = source_dir.join("assets");
+        if assets.is_dir() {
+            add_source_files(
+                &mut data_root,
+                &assets,
+                &assets,
+                Some("scar"),
+                &FileStorageType::BufferCompress,
+            )?;
         }
-        Ok(count)
+        let prebuilt_data = source_dir.join("prebuilt").join("data");
+        if prebuilt_data.is_dir() {
+            add_source_files(
+                &mut data_root,
+                &prebuilt_data,
+                &prebuilt_data,
+                None,
+                &FileStorageType::Store,
+            )?;
+        }
+        if !folder_is_empty(&data_root) {
+            tocs.push(Toc {
+                alias: "data".to_string(),
+                name: "data".to_string(),
+                root: data_root,
+            });
+        }
+
+        for alias in ["info", "locale"] {
+            let base = source_dir.join("prebuilt").join(alias);
+            if base.is_dir() {
+                let mut root = Folder {
+                    name: String::new(),
+                    folders: Vec::new(),
+                    files: Vec::new(),
+                };
+                add_source_files(&mut root, &base, &base, None, &FileStorageType::Store)?;
+                if !folder_is_empty(&root) {
+                    tocs.push(Toc {
+                        alias: alias.to_string(),
+                        name: alias.to_string(),
+                        root,
+                    });
+                }
+            }
+        }
+
+        Ok(Archive {
+            name,
+            version: 11,
+            product: 0,
+            block_size: DEFAULT_BLOCK_SIZE,
+            header_encryption_type: FileEncryptionType::None,
+            signature: [0u8; 256],
+            tocs,
+        })
     }
+}
+
+fn read_guid(dir: &Path) -> Result<String> {
+    let aoe4mod = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("aoe4mod")))
+        .ok_or_else(|| anyhow!("no .aoe4mod file found in {}", dir.display()))?;
+    let content = std::fs::read_to_string(&aoe4mod)?;
+    let start =
+        content.find("<ID>").ok_or_else(|| anyhow!("no <ID> in {}", aoe4mod.display()))? + 4;
+    let end = content[start..]
+        .find("</ID>")
+        .ok_or_else(|| anyhow!("malformed <ID> in {}", aoe4mod.display()))?
+        + start;
+    Ok(content[start..end].replace('-', ""))
+}
+
+fn folder_is_empty(folder: &Folder) -> bool {
+    folder.files.is_empty() && folder.folders.is_empty()
+}
+
+fn add_source_files(
+    root: &mut Folder,
+    base: &Path,
+    dir: &Path,
+    only_ext: Option<&str>,
+    storage: &FileStorageType,
+) -> Result<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            add_source_files(root, base, &path, only_ext, storage)?;
+            continue;
+        }
+
+        if let Some(ext) = only_ext {
+            let matches = path
+                .extension()
+                .map(|e| e.to_string_lossy().eq_ignore_ascii_case(ext))
+                .unwrap_or(false);
+            if !matches {
+                continue;
+            }
+        }
+
+        let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let data = std::fs::read(&path)?;
+        let stored = encode(&data, storage)?;
+        let mut crc = Crc::new();
+        crc.update(&stored);
+
+        let file = FileEntry {
+            name: file_name,
+            stored_data: stored,
+            uncompressed_size: data.len() as u32,
+            storage_type: storage.clone(),
+            encryption_type: FileEncryptionType::None,
+            verification_type: FileVerificationType::SHA1Blocks,
+            crc: crc.sum(),
+        };
+        insert_file(root, &rel, file);
+    }
+
+    Ok(())
+}
+
+fn insert_file(root: &mut Folder, rel: &Path, file: FileEntry) {
+    let mut folder = root;
+    if let Some(parent) = rel.parent() {
+        for comp in parent.components() {
+            if let std::path::Component::Normal(os) = comp {
+                let name = os.to_string_lossy().into_owned();
+                let idx = match folder.folders.iter().position(|f| f.name == name) {
+                    Some(i) => i,
+                    None => {
+                        folder.folders.push(Folder {
+                            name,
+                            folders: Vec::new(),
+                            files: Vec::new(),
+                        });
+                        folder.folders.len() - 1
+                    }
+                };
+                folder = &mut folder.folders[idx];
+            }
+        }
+    }
+    folder.files.push(file);
 }
 
 fn encode(data: &[u8], storage: &FileStorageType) -> Result<Vec<u8>> {
@@ -363,43 +519,6 @@ fn encode(data: &[u8], storage: &FileStorageType) -> Result<Vec<u8>> {
             Err(anyhow!("Brotli re-compression is not supported"))
         }
     }
-}
-
-fn recompile_folder(
-    folder: &mut Folder,
-    assets_root: &Path,
-    path: String,
-    count: &mut usize,
-) -> Result<()> {
-    for file in &mut folder.files {
-        if file.encryption_type != FileEncryptionType::None {
-            continue;
-        }
-        let rel = if path.is_empty() {
-            file.name.clone()
-        } else {
-            format!("{}/{}", path, file.name)
-        };
-        let source = assets_root.join(&rel);
-        if source.is_file() {
-            let data = std::fs::read(&source)?;
-            file.uncompressed_size = data.len() as u32;
-            file.stored_data = encode(&data, &file.storage_type)?;
-            let mut crc = Crc::new();
-            crc.update(&file.stored_data);
-            file.crc = crc.sum();
-            *count += 1;
-        }
-    }
-    for sub in &mut folder.folders {
-        let child_path = if path.is_empty() {
-            sub.name.clone()
-        } else {
-            format!("{}/{}", path, sub.name)
-        };
-        recompile_folder(sub, assets_root, child_path, count)?;
-    }
-    Ok(())
 }
 
 fn intern(value: &str, blob: &mut Vec<u8>, map: &mut HashMap<String, u32>) -> u32 {

@@ -19,24 +19,30 @@ Click the releases tab, and then download and install the version you wish to us
 Run sga-archiver with an input archive and an output directory. It will be unpacked.
 
 ```
-Usage: sga-archiver --output <FILE> <INPUT>
+Usage: sga-archiver [OPTIONS] --output <FILE> <INPUT>
 
 Arguments:
-  <INPUT>  Input file path
+  <INPUT>  Input archive to unpack, or mod source directory when --compile is set
 
 Options:
-  -o, --output <FILE>          Output folder path
-      --compile <ASSETS_DIR>   Recompile a mod's source into an archive instead of unpacking
-  -h, --help                   Print help
-  -V, --version                Print version
+  -o, --output <FILE>  Output folder (unpack) or output archive (compile)
+      --compile        Compile a mod source directory into an archive
+  -h, --help           Print help
+  -V, --version        Print version
 ```
 
 ### Compile
 
-With `--compile <ASSETS_DIR>`, the input is treated as a base archive (a previous build) and the output is a freshly packed archive. Source files found under the assets directory are recompressed into the archive; files with no source (burned artifacts such as textures, attributes, and localization) are carried over from the base build. Hashes are regenerated.
+With `--compile`, the input is a mod source directory and the output is a packed `.sga`. The directory is expected to contain:
+
+- `<mod>.aoe4mod` — the mod project file (its `<ID>` becomes the archive name)
+- `assets/scar/**/*.scar` — Lua source, compressed into the `data` TOC as-is
+- `prebuilt/<toc>/<path>` — pre-burned artifacts that can't be produced from source (textures, attributes, localization), grouped by TOC alias, e.g. `prebuilt/info/mod.rrtex`, `prebuilt/locale/en/en.ucs`, `prebuilt/data/scar/winconditions/<name>.bin`
+
+SHA1 hashes are generated and the archive is written unencrypted.
 
 ```
-sga-archiver base.sga -o out.sga --compile ./assets
+sga-archiver "./My Mod" -o out.sga --compile
 ```
 
 ## Limitations

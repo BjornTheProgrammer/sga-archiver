@@ -354,6 +354,7 @@ dependencies = [
 name = "relic-chunky"
 version = "0.1.2"
 dependencies = [
+ "anyhow",
  "byteorder",
  "quick-xml",
  "serde",
