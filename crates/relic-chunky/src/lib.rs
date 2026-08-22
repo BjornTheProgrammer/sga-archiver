@@ -7,5 +7,6 @@ pub mod reflect_type;
 pub mod reflect_write;
 pub mod rgd;
 pub mod rgd_write;
+pub mod attrib;
 pub mod schema_lib;
 pub mod texture;

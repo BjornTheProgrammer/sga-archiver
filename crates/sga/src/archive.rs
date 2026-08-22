@@ -56,6 +56,10 @@ pub struct FileEntry {
     pub encryption_type: FileEncryptionType,
     pub verification_type: FileVerificationType,
     pub crc: u32,
+    /// Original position of this file's data in the archive's data blob, if read
+    /// from one. The editor's data-blob order isn't a simple tree traversal, so
+    /// preserving it lets a read→write round-trip stay byte-identical.
+    pub data_order: Option<u64>,
 }
 
 impl FileEntry {
@@ -153,11 +157,39 @@ impl Archive {
         let mut toc_entries: Vec<SgaToC> = Vec::new();
         let mut folder_entries: Vec<SgaFolderEntry> = Vec::new();
         let mut file_entries: Vec<SgaFileEntry> = Vec::new();
-        let mut string_blob: Vec<u8> = Vec::new();
-        let mut string_offsets: HashMap<String, u32> = HashMap::new();
         let mut data_blob: Vec<u8> = Vec::new();
         let mut hash_blob: Vec<u8> = Vec::new();
         let mut hash_offsets: HashMap<Vec<u8>, u32> = HashMap::new();
+
+        // The string blob is emitted depth-first (each folder's full path, then
+        // its file names, then its children recursively) with no deduplication —
+        // the order and layout the editor produces. Build it first, recording a
+        // string offset per folder/file (keyed by TOC + path so identical names
+        // in different folders stay distinct), then reference those offsets when
+        // building the folder/file tables (which are laid out breadth-first).
+        let mut string_blob: Vec<u8> = Vec::new();
+        let mut folder_str: HashMap<(usize, String), u32> = HashMap::new();
+        let mut file_str: HashMap<(usize, String, String), u32> = HashMap::new();
+        for (ti, toc) in self.tocs.iter().enumerate() {
+            dfs_strings(ti, &toc.root, "", &mut string_blob, &mut folder_str, &mut file_str);
+        }
+
+        // Build the data blob. When every file preserves its original position
+        // (a read→write round-trip), lay the files out in that order so the blob
+        // is byte-identical; otherwise fall back to tree order. Record each
+        // file's assigned data offset for the table pass below.
+        let mut file_data_off: HashMap<(usize, String, String), u64> = HashMap::new();
+        let mut all_files: Vec<(usize, String, String, &FileEntry)> = Vec::new();
+        for (ti, toc) in self.tocs.iter().enumerate() {
+            collect_files(ti, &toc.root, "", &mut all_files);
+        }
+        if all_files.iter().all(|(_, _, _, f)| f.data_order.is_some()) {
+            all_files.sort_by_key(|(_, _, _, f)| f.data_order.unwrap());
+        }
+        for (ti, full, name, file) in &all_files {
+            file_data_off.insert((*ti, full.clone(), name.clone()), data_blob.len() as u64);
+            data_blob.extend_from_slice(&file.stored_data);
+        }
 
         let block_size = if self.block_size == 0 {
             DEFAULT_BLOCK_SIZE
@@ -165,15 +197,47 @@ impl Archive {
             self.block_size
         } as usize;
 
-        for toc in &self.tocs {
+        // File table: depth-first (each folder's files grouped together, folders
+        // visited depth-first), recording each folder's contiguous file range.
+        let mut folder_file_range: HashMap<(usize, String), (u32, u32)> = HashMap::new();
+        let mut toc_file_ranges: Vec<(u32, u32)> = Vec::new();
+        for (ti, toc) in self.tocs.iter().enumerate() {
+            let start = file_entries.len() as u32;
+            dfs_files(
+                ti,
+                &toc.root,
+                "",
+                &mut file_entries,
+                &mut folder_file_range,
+                &file_str,
+                &file_data_off,
+                &mut hash_blob,
+                &mut hash_offsets,
+                block_size,
+            );
+            toc_file_ranges.push((start, file_entries.len() as u32));
+        }
+
+        // Folder sub-folder ranges: the array is breadth-first, but the
+        // start/end *values* follow a depth-first counter (each folder claims
+        // `child count` indices in pre-order). Compute those ranges first.
+        let mut folder_range: HashMap<(usize, String), (u32, u32)> = HashMap::new();
+        let mut base = 0u32;
+        for (ti, toc) in self.tocs.iter().enumerate() {
+            let mut counter = base + 1;
+            dfs_folder_ranges(ti, &toc.root, "", &mut counter, &mut folder_range);
+            base = counter;
+        }
+
+        // Folder table: breadth-first, referencing the depth-first file ranges
+        // and the folder ranges computed above.
+        for (ti, toc) in self.tocs.iter().enumerate() {
             let toc_folder_start = folder_entries.len() as u32;
-            let toc_file_start = file_entries.len() as u32;
             let root_index = folder_entries.len() as u32;
 
-            let root_name_off = intern("", &mut string_blob, &mut string_offsets);
             let root_entry_index = folder_entries.len();
             folder_entries.push(SgaFolderEntry {
-                name_offset: root_name_off,
+                name_offset: folder_str[&(ti, String::new())],
                 folder_start_index: 0,
                 folder_end_index: 0,
                 file_start_index: 0,
@@ -184,35 +248,9 @@ impl Archive {
             queue.push_back((root_entry_index, &toc.root, String::new()));
 
             while let Some((idx, folder, full)) = queue.pop_front() {
-                let file_start = file_entries.len() as u32;
-                for file in &folder.files {
-                    let name_off = intern(&file.name, &mut string_blob, &mut string_offsets);
-                    let data_off = data_blob.len() as u64;
-                    data_blob.extend_from_slice(&file.stored_data);
-                    let storage_byte =
-                        (file.encryption_type.to_u8() << 4) | file.storage_type.to_u8();
-                    let hash_off = if file.verification_type == FileVerificationType::SHA1Blocks {
-                        let hash = block_sha1(&file.stored_data, block_size);
-                        intern_hash(hash, &mut hash_blob, &mut hash_offsets)
-                    } else {
-                        0
-                    };
-                    file_entries.push(SgaFileEntry {
-                        name_offset: name_off,
-                        hash_offset: hash_off,
-                        data_offset: data_off,
-                        compressed_length: file.stored_data.len() as u32,
-                        uncompressed_size: file.uncompressed_size,
-                        unknown: 0,
-                        verification_byte: file.verification_type.to_u8(),
-                        storage_byte,
-                        crc: file.crc,
-                        hash_offset_v7: 0,
-                    });
-                }
-                let file_end = file_entries.len() as u32;
+                let (file_start, file_end) = folder_file_range[&(ti, full.clone())];
+                let (folder_start, folder_end) = folder_range[&(ti, full.clone())];
 
-                let folder_start = folder_entries.len() as u32;
                 let mut children: Vec<(usize, &Folder, String)> = Vec::new();
                 for child in &folder.folders {
                     let child_full = if full.is_empty() {
@@ -220,10 +258,9 @@ impl Archive {
                     } else {
                         format!("{}\\{}", full, child.name)
                     };
-                    let name_off = intern(&child_full, &mut string_blob, &mut string_offsets);
                     let cidx = folder_entries.len();
                     folder_entries.push(SgaFolderEntry {
-                        name_offset: name_off,
+                        name_offset: folder_str[&(ti, child_full.clone())],
                         folder_start_index: 0,
                         folder_end_index: 0,
                         file_start_index: 0,
@@ -231,7 +268,6 @@ impl Archive {
                     });
                     children.push((cidx, child, child_full));
                 }
-                let folder_end = folder_entries.len() as u32;
 
                 folder_entries[idx].folder_start_index = folder_start;
                 folder_entries[idx].folder_end_index = folder_end;
@@ -243,14 +279,12 @@ impl Archive {
                 }
             }
 
-            let toc_folder_end = folder_entries.len() as u32;
-            let toc_file_end = file_entries.len() as u32;
-
+            let (toc_file_start, toc_file_end) = toc_file_ranges[ti];
             toc_entries.push(SgaToC {
                 alias: to_fixed(&toc.alias),
                 name: to_fixed(&toc.name),
                 folder_start_index: toc_folder_start,
-                folder_end_index: toc_folder_end,
+                folder_end_index: folder_entries.len() as u32,
                 file_start_index: toc_file_start,
                 file_end_index: toc_file_end,
                 folder_root_index: root_index,
@@ -273,7 +307,7 @@ impl Archive {
 
         let header = SgaHeader {
             magic: *b"_ARCHIVE",
-            version: 11,
+            version: self.version,
             product: self.product,
             name: self.name.clone(),
             header_blob_offset,
@@ -303,13 +337,13 @@ impl Archive {
         writer.write_all(&data_blob)?;
         header.write_index_table(writer)?;
         for entry in &toc_entries {
-            entry.write_le_args(writer, (11u16,))?;
+            entry.write_le_args(writer, (self.version,))?;
         }
         for entry in &folder_entries {
-            entry.write_le_args(writer, (11u16,))?;
+            entry.write_le_args(writer, (self.version,))?;
         }
         for entry in &file_entries {
-            entry.write_le_args(writer, (11u16,))?;
+            entry.write_le_args(writer, (self.version,))?;
         }
         writer.write_all(&string_blob)?;
         writer.write_all(&hash_blob)?;
@@ -632,6 +666,7 @@ fn stored_file(rel: &Path, data: Vec<u8>) -> FileEntry {
         encryption_type: FileEncryptionType::None,
         verification_type: FileVerificationType::SHA1Blocks,
         crc: crc.sum(),
+        data_order: None,
     }
 }
 
@@ -781,6 +816,7 @@ fn add_source_files(
             encryption_type: FileEncryptionType::None,
             verification_type: FileVerificationType::SHA1Blocks,
             crc: crc.sum(),
+            data_order: None,
         };
         insert_file(root, &rel, file);
     }
@@ -836,15 +872,142 @@ fn encode(data: &[u8], storage: &FileStorageType) -> Result<Vec<u8>> {
     }
 }
 
-fn intern(value: &str, blob: &mut Vec<u8>, map: &mut HashMap<String, u32>) -> u32 {
-    if let Some(&offset) = map.get(value) {
-        return offset;
+/// Depth-first pass building the file table: each folder's files are emitted
+/// together (folders visited depth-first), and each folder's contiguous file
+/// range is recorded for the folder table to reference.
+#[allow(clippy::too_many_arguments)]
+fn dfs_files(
+    ti: usize,
+    folder: &Folder,
+    full: &str,
+    file_entries: &mut Vec<SgaFileEntry>,
+    folder_file_range: &mut HashMap<(usize, String), (u32, u32)>,
+    file_str: &HashMap<(usize, String, String), u32>,
+    file_data_off: &HashMap<(usize, String, String), u64>,
+    hash_blob: &mut Vec<u8>,
+    hash_offsets: &mut HashMap<Vec<u8>, u32>,
+    block_size: usize,
+) {
+    let start = file_entries.len() as u32;
+    for file in &folder.files {
+        let key = (ti, full.to_string(), file.name.clone());
+        let hash_off = if file.verification_type == FileVerificationType::SHA1Blocks {
+            intern_hash(block_sha1(&file.stored_data, block_size), hash_blob, hash_offsets)
+        } else {
+            // Non-hashed files (CRC / none) still record the current end of the
+            // hash blob rather than 0.
+            hash_blob.len() as u32
+        };
+        file_entries.push(SgaFileEntry {
+            name_offset: file_str[&key],
+            hash_offset: hash_off,
+            data_offset: file_data_off[&key],
+            compressed_length: file.stored_data.len() as u32,
+            uncompressed_size: file.uncompressed_size,
+            unknown: 0,
+            verification_byte: file.verification_type.to_u8(),
+            storage_byte: (file.encryption_type.to_u8() << 4) | file.storage_type.to_u8(),
+            crc: file.crc,
+            hash_offset_v7: 0,
+        });
     }
+    folder_file_range.insert((ti, full.to_string()), (start, file_entries.len() as u32));
+    for child in &folder.folders {
+        let child_full = if full.is_empty() {
+            child.name.clone()
+        } else {
+            format!("{full}\\{}", child.name)
+        };
+        dfs_files(
+            ti,
+            child,
+            &child_full,
+            file_entries,
+            folder_file_range,
+            file_str,
+            file_data_off,
+            hash_blob,
+            hash_offsets,
+            block_size,
+        );
+    }
+}
+
+/// Assigns each folder's sub-folder index range using a depth-first counter
+/// (start = counter, then counter advances by the folder's direct child count),
+/// matching the editor's folder-table layout.
+fn dfs_folder_ranges(
+    ti: usize,
+    folder: &Folder,
+    full: &str,
+    counter: &mut u32,
+    out: &mut HashMap<(usize, String), (u32, u32)>,
+) {
+    let start = *counter;
+    *counter += folder.folders.len() as u32;
+    out.insert((ti, full.to_string()), (start, *counter));
+    for child in &folder.folders {
+        let child_full = if full.is_empty() {
+            child.name.clone()
+        } else {
+            format!("{full}\\{}", child.name)
+        };
+        dfs_folder_ranges(ti, child, &child_full, counter, out);
+    }
+}
+
+/// Collects every file with its `(toc, folder full path, name)` key, in tree
+/// order.
+fn collect_files<'a>(
+    ti: usize,
+    folder: &'a Folder,
+    full: &str,
+    out: &mut Vec<(usize, String, String, &'a FileEntry)>,
+) {
+    for file in &folder.files {
+        out.push((ti, full.to_string(), file.name.clone(), file));
+    }
+    for child in &folder.folders {
+        let child_full = if full.is_empty() {
+            child.name.clone()
+        } else {
+            format!("{full}\\{}", child.name)
+        };
+        collect_files(ti, child, &child_full, out);
+    }
+}
+
+/// Appends a NUL-terminated string to the blob, returning its offset.
+fn append_str(blob: &mut Vec<u8>, value: &str) -> u32 {
     let offset = blob.len() as u32;
     blob.extend_from_slice(value.as_bytes());
     blob.push(0);
-    map.insert(value.to_string(), offset);
     offset
+}
+
+/// Depth-first pass building the string blob: each folder emits its full path,
+/// then its file names, then recurses into child folders — no deduplication.
+/// Records each string's offset keyed by `(toc, path[, file name])`.
+fn dfs_strings(
+    ti: usize,
+    folder: &Folder,
+    full: &str,
+    blob: &mut Vec<u8>,
+    folder_str: &mut HashMap<(usize, String), u32>,
+    file_str: &mut HashMap<(usize, String, String), u32>,
+) {
+    folder_str.insert((ti, full.to_string()), append_str(blob, full));
+    for file in &folder.files {
+        file_str.insert((ti, full.to_string(), file.name.clone()), append_str(blob, &file.name));
+    }
+    for child in &folder.folders {
+        let child_full = if full.is_empty() {
+            child.name.clone()
+        } else {
+            format!("{full}\\{}", child.name)
+        };
+        dfs_strings(ti, child, &child_full, blob, folder_str, file_str);
+    }
 }
 
 fn block_sha1(data: &[u8], block_size: usize) -> Vec<u8> {
@@ -977,6 +1140,7 @@ fn build_file<R: Read + Seek>(
         encryption_type,
         verification_type,
         crc: if version >= 6 { entry.crc } else { 0 },
+        data_order: Some(entry.data_offset),
     })
 }
 
@@ -1023,6 +1187,7 @@ fn build_from_dir(dir: &Path) -> Result<Folder> {
                 encryption_type: FileEncryptionType::None,
                 verification_type: FileVerificationType::SHA1Blocks,
                 crc: 0,
+                data_order: None,
             });
         }
     }
