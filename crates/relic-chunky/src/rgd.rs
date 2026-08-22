@@ -11,7 +11,10 @@ use quick_xml::{
 use serde::Serialize;
 use thiserror::Error;
 
+use binrw::BinRead;
+
 use crate::container::Chunky;
+use crate::records::KeyTable;
 
 #[derive(Debug)]
 pub struct RelicGameData {}
@@ -233,24 +236,11 @@ impl RelicGameData {
     }
 
     pub fn parse_keys(data: &[u8]) -> Result<HashMap<u64, String>, RelicGameDataError> {
+        let table = KeyTable::read(&mut Cursor::new(data)).map_err(io::Error::other)?;
         let mut key_string_map = HashMap::new();
-        let mut reader = Cursor::new(data);
-
-        let count = reader.read_u32::<LittleEndian>()?;
-
-        for _ in 0..count {
-            let key = reader.read_u64::<LittleEndian>()?;
-            let string_length = reader.read_u32::<LittleEndian>()?;
-
-            let string = {
-                let mut string_bytes = vec![0u8; string_length as usize];
-                reader.read_exact(&mut string_bytes)?;
-                String::from_utf8_lossy(&string_bytes).to_string()
-            };
-
-            key_string_map.entry(key).or_insert(string);
+        for entry in table.keys {
+            key_string_map.entry(entry.hash).or_insert(entry.value);
         }
-
         Ok(key_string_map)
     }
 

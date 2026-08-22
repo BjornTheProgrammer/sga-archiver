@@ -1,12 +1,14 @@
 use std::collections::HashMap;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 
 use anyhow::{anyhow, bail, Result};
+use binrw::BinWrite;
 use byteorder::{LittleEndian, WriteBytesExt};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use crate::container::{Chunk, ChunkBody, ChunkKind, Chunky};
+use crate::records::{HashedString, InternedStringTable, ObjectRecord, ObjectTable};
 use crate::reflect_type::SchemaRegistry;
 
 /// The reflection data blob (`RFCI`) is the first chunk, so its bytes begin
@@ -510,22 +512,23 @@ fn place_all(objects: &[RdoObject], registry: &SchemaRegistry) -> Result<(State,
 }
 
 fn build_robj(st: &State, objects: &[RdoObject], registry: &SchemaRegistry) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    out.write_u32::<LittleEndian>(st.order.len() as u32)?;
-    out.write_u32::<LittleEndian>(0)?;
+    let mut records = Vec::with_capacity(st.order.len());
     for &(idx, off) in &st.order {
         let object = &objects[idx];
         let ty = registry
             .by_name(&object.type_name)
             .ok_or_else(|| anyhow!("type not in registry: {}", object.type_name))?;
-        out.write_u64::<LittleEndian>(object.id)?;
-        out.write_u64::<LittleEndian>(ty.hash)?;
-        out.write_u32::<LittleEndian>(RFCI_FILE_OFFSET + off)?;
-        out.write_u32::<LittleEndian>(0)?;
-        out.write_u64::<LittleEndian>(object.owner_id)?;
-        out.write_u32::<LittleEndian>(ty.trailer)?;
+        records.push(ObjectRecord {
+            id: object.id,
+            type_hash: ty.hash,
+            data_offset: RFCI_FILE_OFFSET + off,
+            owner_id: object.owner_id,
+            trailer: ty.trailer,
+        });
     }
-    Ok(out)
+    let mut out = Cursor::new(Vec::new());
+    ObjectTable { records }.write_le(&mut out)?;
+    Ok(out.into_inner())
 }
 
 /// The relocation table: the sorted file offsets of every 8-byte relative
@@ -575,15 +578,14 @@ fn build_rnew(
 }
 
 fn build_rshi(st: &State) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    out.write_u32::<LittleEndian>(st.rshi.len() as u32)?;
-    out.write_u32::<LittleEndian>(0)?;
-    for (hash, value) in &st.rshi {
-        out.write_u64::<LittleEndian>(*hash)?;
-        out.write_u32::<LittleEndian>(value.len() as u32)?;
-        out.write_all(value.as_bytes())?;
-    }
-    Ok(out)
+    let strings = st
+        .rshi
+        .iter()
+        .map(|(hash, value)| HashedString { hash: *hash, value: value.clone() })
+        .collect();
+    let mut out = Cursor::new(Vec::new());
+    InternedStringTable { strings }.write_le(&mut out)?;
+    Ok(out.into_inner())
 }
 
 fn replace_chunk(chunks: &mut [Chunk], name: &[u8; 4], data: Vec<u8>) -> bool {

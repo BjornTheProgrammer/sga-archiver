@@ -3,14 +3,16 @@
 //! `AEGD` (`[u32 CRC32][node list]`) and `KEYS` (the hash->string dictionary).
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::Cursor;
 
 use anyhow::Result;
+use binrw::BinWrite;
 use byteorder::{LittleEndian, WriteBytesExt};
 use flate2::Crc;
 
 use crate::container::{Chunk, ChunkBody, ChunkKind, Chunky};
 use crate::hash::dictionary_hash;
+use crate::records::{HashedString, KeyTable};
 
 /// A game-data value. `List` is the engine's keyed table (RGD type 100); `List2`
 /// is its ordered/reference list (type 101).
@@ -68,14 +70,15 @@ pub fn write_rgd(nodes: &[Node]) -> Result<Vec<u8>> {
     let mut aegd = crc.sum().to_le_bytes().to_vec();
     aegd.extend_from_slice(&node_bytes);
 
-    let keys = gather_keys(nodes);
-    let mut keys_data = Vec::new();
-    keys_data.write_u32::<LittleEndian>(keys.len() as u32)?;
-    for (hash, key) in &keys {
-        keys_data.write_u64::<LittleEndian>(*hash)?;
-        keys_data.write_u32::<LittleEndian>(key.len() as u32)?;
-        keys_data.write_all(key.as_bytes())?;
-    }
+    let keys = KeyTable {
+        keys: gather_keys(nodes)
+            .into_iter()
+            .map(|(hash, value)| HashedString { hash, value })
+            .collect(),
+    };
+    let mut keys_cursor = Cursor::new(Vec::new());
+    keys.write_le(&mut keys_cursor)?;
+    let keys_data = keys_cursor.into_inner();
 
     let chunky = Chunky {
         major: 4,

@@ -171,3 +171,25 @@ fn missing_keys_chunk_is_an_error() {
     let chunky = Chunky::read(&mut Cursor::new(bytes)).unwrap();
     assert!(RelicGameData::parse(&chunky).is_err());
 }
+
+/// The `KeyTable` binrw definition must reproduce a real `KEYS` chunk exactly,
+/// so read (rgd) and write (rgd_write/attrib) stay byte-compatible.
+#[test]
+fn keys_table_round_trips_byte_exact() {
+    use binrw::{BinRead, BinWrite};
+    use relic_chunky::records::KeyTable;
+
+    let chunky = Chunky::read(&mut Cursor::new(FIXTURE)).unwrap();
+    let keys = chunky
+        .data_chunks()
+        .into_iter()
+        .find(|(c, _)| c.name_str() == "KEYS")
+        .and_then(|(c, _)| c.data().map(<[u8]>::to_vec))
+        .expect("fixture has a KEYS chunk");
+
+    let table = KeyTable::read(&mut Cursor::new(&keys)).unwrap();
+    let mut out = Cursor::new(Vec::new());
+    table.write_le(&mut out).unwrap();
+
+    assert_eq!(out.into_inner(), keys, "KeyTable round-trip was not byte-exact");
+}

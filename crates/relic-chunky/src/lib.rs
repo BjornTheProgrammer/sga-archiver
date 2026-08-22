@@ -4,6 +4,7 @@ pub mod decompile;
 pub mod reflect;
 pub mod reflect_type;
 pub mod reflect_write;
+pub mod records;
 pub mod rgd;
 pub mod rgd_write;
 pub mod attrib;

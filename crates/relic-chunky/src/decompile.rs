@@ -1,7 +1,11 @@
 
 use std::collections::HashMap;
+use std::io::Cursor;
+
+use binrw::BinRead;
 
 use crate::container::Chunky;
+use crate::records::{InternedStringTable, ObjectTable};
 use crate::reflect_type::{parse_type, FieldDef, TypeDef};
 
 fn u32_at(b: &[u8], off: usize) -> Option<u32> {
@@ -33,42 +37,25 @@ pub struct DecompiledReflect {
 }
 
 fn parse_objects(bytes: &[u8]) -> Vec<ObjectRef> {
-    let mut out = Vec::new();
-    let count = u32_at(bytes, 0).unwrap_or(0) as usize;
-    let mut p = 8;
-    for _ in 0..count {
-        let (Some(id), Some(type_hash), Some(data_offset)) =
-            (u64_at(bytes, p), u64_at(bytes, p + 8), u32_at(bytes, p + 16))
-        else {
-            break;
-        };
-        let owner_id = u64_at(bytes, p + 24).unwrap_or(0);
-        out.push(ObjectRef {
-            id,
-            type_hash,
-            owner_id,
-            data_offset: data_offset as usize,
-        });
-        p += 36;
-    }
-    out
+    let Ok(table) = ObjectTable::read(&mut Cursor::new(bytes)) else {
+        return Vec::new();
+    };
+    table
+        .records
+        .into_iter()
+        .map(|r| ObjectRef {
+            id: r.id,
+            type_hash: r.type_hash,
+            owner_id: r.owner_id,
+            data_offset: r.data_offset as usize,
+        })
+        .collect()
 }
 
 fn parse_interned(bytes: &[u8]) -> HashMap<u64, String> {
-    let mut out = HashMap::new();
-    let count = u64_at(bytes, 0).unwrap_or(0);
-    let mut p = 8;
-    for _ in 0..count {
-        let (Some(hash), Some(len)) = (u64_at(bytes, p), u32_at(bytes, p + 8)) else {
-            break;
-        };
-        p += 12;
-        let len = len as usize;
-        let Some(raw) = bytes.get(p..p + len) else { break };
-        p += len;
-        out.insert(hash, String::from_utf8_lossy(raw).into_owned());
-    }
-    out
+    InternedStringTable::read(&mut Cursor::new(bytes))
+        .map(|table| table.strings.into_iter().map(|s| (s.hash, s.value)).collect())
+        .unwrap_or_default()
 }
 
 impl DecompiledReflect {

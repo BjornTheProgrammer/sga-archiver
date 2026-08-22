@@ -16,6 +16,7 @@ anyhow.workspace = true
 flate2 = { workspace = true }
 png = { workspace = true }
 intel_tex_2 = { workspace = true }
+binrw = "0.15.2"
 
 [dev-dependencies]
 image_dds = "0.7"

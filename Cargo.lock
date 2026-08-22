@@ -581,6 +581,7 @@ name = "relic-chunky"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "binrw",
  "byteorder",
  "flate2",
  "image_dds",

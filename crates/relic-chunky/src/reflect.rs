@@ -1,5 +1,10 @@
 
+use std::io::Cursor;
+
+use binrw::BinRead;
+
 use crate::container::Chunky;
+use crate::records::InternedStringTable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflectType {
@@ -103,36 +108,15 @@ fn parse_rfty(bytes: &[u8]) -> Option<ReflectType> {
 }
 
 fn parse_rshi(bytes: &[u8]) -> Vec<InternedString> {
-    let mut out = Vec::new();
-    let mut off = 0usize;
-
-    let read_u32 = |b: &[u8], o: usize| -> Option<u32> {
-        b.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
-    };
-    let read_u64 = |b: &[u8], o: usize| -> Option<u64> {
-        b.get(o..o + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
-    };
-
-    let Some(count) = read_u64(bytes, off) else {
-        return out;
-    };
-    off += 8;
-
-    for _ in 0..count {
-        let Some(hash) = read_u64(bytes, off) else { break };
-        off += 8;
-        let Some(len) = read_u32(bytes, off) else { break };
-        off += 4;
-        let len = len as usize;
-        let Some(raw) = bytes.get(off..off + len) else { break };
-        off += len;
-        out.push(InternedString {
-            hash,
-            value: String::from_utf8_lossy(raw).into_owned(),
-        });
-    }
-
-    out
+    InternedStringTable::read(&mut Cursor::new(bytes))
+        .map(|table| {
+            table
+                .strings
+                .into_iter()
+                .map(|s| InternedString { hash: s.hash, value: s.value })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[doc(hidden)]
