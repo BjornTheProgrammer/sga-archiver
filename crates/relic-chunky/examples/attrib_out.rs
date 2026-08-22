@@ -1,1 +1,0 @@
-fn main(){let a:Vec<String>=std::env::args().collect();let xml=std::fs::read_to_string(&a[1]).unwrap();let out=relic_chunky::attrib::compile_attrib(&xml).unwrap();std::fs::write(&a[2],&out).unwrap();println!("wrote {} bytes",out.len());}
