@@ -226,53 +226,7 @@ fn align_file(rel: u32, align: u32) -> u32 {
     (((RFCI_FILE_OFFSET + rel) + align - 1) & !(align - 1)) - RFCI_FILE_OFFSET
 }
 
-// ---------------------------------------------------------------------------
-// CityHash64 (used to intern enum / string-hash values, matching the engine)
-// ---------------------------------------------------------------------------
-
-const K0: u64 = 0xc3a5c85c97cb3127;
-const K2: u64 = 0x9ae16a3b2f90404f;
-
-fn u64_le(b: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
-}
-fn u32_le(b: &[u8], o: usize) -> u64 {
-    u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as u64
-}
-
-fn hash_len_16(u: u64, v: u64, mul: u64) -> u64 {
-    let mut a = (u ^ v).wrapping_mul(mul);
-    a ^= a >> 47;
-    let mut b = (v ^ a).wrapping_mul(mul);
-    b ^= b >> 47;
-    b.wrapping_mul(mul)
-}
-
-fn city_hash64(bytes: &[u8]) -> u64 {
-    let n = bytes.len();
-    if n >= 8 {
-        let mul = K2.wrapping_add(2 * n as u64);
-        let a = u64_le(bytes, 0).wrapping_add(K2);
-        let b = u64_le(bytes, n - 8);
-        let u = b.rotate_right(37).wrapping_mul(mul).wrapping_add(a);
-        let v = a.rotate_right(25).wrapping_add(b).wrapping_mul(mul);
-        hash_len_16(u, v, mul)
-    } else if n >= 4 {
-        let mul = K2.wrapping_add(2 * n as u64);
-        let u = (n as u64).wrapping_add(u32_le(bytes, 0) << 3);
-        hash_len_16(u, u32_le(bytes, n - 4), mul)
-    } else if n > 0 {
-        let a = bytes[0] as u64;
-        let b = bytes[n >> 1] as u64;
-        let c = bytes[n - 1] as u64;
-        let y = a.wrapping_add(b << 8);
-        let z = (n as u64).wrapping_add(c << 2);
-        let mixed = y.wrapping_mul(K2) ^ z.wrapping_mul(K0);
-        (mixed ^ (mixed >> 47)).wrapping_mul(K2)
-    } else {
-        K2
-    }
-}
+use crate::hash::city_hash64;
 
 // ---------------------------------------------------------------------------
 // Serializer
