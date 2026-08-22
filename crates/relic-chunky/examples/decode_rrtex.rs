@@ -48,6 +48,7 @@ fn main() {
         off += comp;
     }
 
+    // Skip the 16-byte surface descriptor that precedes the BC7 blocks.
     let surface = Surface {
         width,
         height,
@@ -55,7 +56,7 @@ fn main() {
         layers: 1,
         mipmaps: 1,
         image_format: ImageFormat::BC7RgbaUnorm,
-        data: bc7,
+        data: &bc7[16..],
     };
     let rgba = surface.decode_rgba8().unwrap();
 
