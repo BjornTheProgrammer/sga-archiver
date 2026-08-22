@@ -5,157 +5,56 @@ use std::{
 };
 
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand};
 use relic_chunky::{
     chunky::ChunkFile,
     decompile::DecompiledReflect,
     reflect::ReflectFile,
-    rgd::{RelicGameData, game_data_to_json, game_data_to_xml},
+    rgd::{RelicGameData, game_data_to_xml},
 };
 use sga::{extract_all, read_header};
-
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
-enum RgdFormat {
-    Xml,
-    Json,
-    None,
-}
-
-impl RgdFormat {
-    fn extension(&self) -> Option<&'static str> {
-        match self {
-            RgdFormat::Xml => Some("xml"),
-            RgdFormat::Json => Some("json"),
-            RgdFormat::None => None,
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
-enum ReflectFormat {
-    Text,
-    None,
-}
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    input: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    #[arg(short, long, value_name = "FILE")]
-    output: PathBuf,
-
-    #[arg(long, value_enum, default_value_t = RgdFormat::Xml)]
-    rgd_format: RgdFormat,
-
-    #[arg(long, value_enum, default_value_t = ReflectFormat::Text)]
-    reflect_format: ReflectFormat,
-
-    #[arg(long)]
-    compile: bool,
-
-    #[arg(long)]
-    dump_schema: bool,
-
-    /// Extract reflection schema resources (`<RootType>.schema`) from the `.bin`
-    /// files under the input directory, into the output directory.
-    #[arg(long)]
-    dump_schema_lib: bool,
-
-    /// Compile a single PNG (input) into a Relic `.rrtex` texture (output).
-    #[arg(long)]
-    compile_texture: bool,
+#[derive(Subcommand)]
+enum Command {
+    /// Compile a mod source directory into an `.sga` archive.
+    Pack {
+        /// Mod source directory.
+        input: PathBuf,
+        /// Output `.sga` archive.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Unpack an `.sga` archive into a directory.
+    Unpack {
+        /// Input `.sga` archive.
+        input: PathBuf,
+        /// Output directory.
+        #[arg(short, long, value_name = "DIR")]
+        output: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    if cli.dump_schema {
-        let mut registry = relic_chunky::reflect_type::SchemaRegistry::new();
-        let scanned = registry.scan_dir(&cli.input)?;
-        let json = serde_json::to_string_pretty(&registry)?;
-        std::fs::write(&cli.output, json)?;
-        println!(
-            "Scanned {} reflection files, collected {} unique types -> {}",
-            scanned,
-            registry.types.len(),
-            cli.output.display()
-        );
-        return Ok(());
-    }
-
-    if cli.dump_schema_lib {
-        let count = dump_schema_lib(&cli.input, &cli.output)?;
-        println!("Wrote {count} schema resource(s) -> {}", cli.output.display());
-        return Ok(());
-    }
-
-    if cli.compile_texture {
-        let png = fs::read(&cli.input)?;
-        let name = cli.input.file_stem().and_then(|s| s.to_str()).unwrap_or("texture");
-        let rrtex = relic_chunky::texture::compile_texture(&png, name)?;
-        fs::write(&cli.output, &rrtex)?;
-        println!(
-            "Compiled {} into {} ({} bytes)",
-            cli.input.display(),
-            cli.output.display(),
-            rrtex.len()
-        );
-        return Ok(());
-    }
-
-    if cli.compile {
-        sga::compile(&cli.input, &cli.output)?;
-        println!(
-            "Compiled {} into {}",
-            cli.input.display(),
-            cli.output.display()
-        );
-        return Ok(());
-    }
-
-    let written_files = extract_all(&cli.input, &cli.output)?;
-    decode_rgd_files(&written_files, cli.rgd_format)?;
-    decode_reflect_files(&written_files, cli.reflect_format)?;
-    write_aoe4mod(&cli.input, &cli.output, &written_files)?;
-
-    Ok(())
-}
-
-/// Walks `input` for reflection `.bin` files and writes one
-/// `<RootType>.schema` resource per distinct root type into `out_dir`.
-fn dump_schema_lib(input: &Path, out_dir: &Path) -> Result<usize> {
-    fs::create_dir_all(out_dir)?;
-    let mut written = 0;
-    let mut stack = vec![input.to_path_buf()];
-    let mut seen = std::collections::HashSet::new();
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("bin")) {
-                continue;
-            }
-            let bytes = fs::read(&path)?;
-            let Ok((root_type, schema)) = relic_chunky::reflect_write::extract_schema(&bytes) else {
-                continue;
-            };
-            let file_name: String = root_type
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            if seen.insert(file_name.clone()) {
-                fs::write(out_dir.join(format!("{file_name}.schema")), &schema)?;
-                println!("  {} -> {file_name}.schema ({} bytes)", root_type, schema.len());
-                written += 1;
-            }
+    match Cli::parse().command {
+        Command::Pack { input, output } => {
+            sga::compile(&input, &output)?;
+            println!("Packed {} into {}", input.display(), output.display());
+        }
+        Command::Unpack { input, output } => {
+            let written = extract_all(&input, &output)?;
+            decode_rgd_files(&written);
+            decode_reflect_files(&written);
+            write_aoe4mod(&input, &output, &written)?;
         }
     }
-    Ok(written)
+    Ok(())
 }
 
 fn write_aoe4mod(input: &Path, output: &Path, written_files: &[PathBuf]) -> Result<()> {
@@ -217,34 +116,23 @@ fn format_guid(raw: &str) -> String {
     }
 }
 
-fn decode_reflect_files(written_files: &[PathBuf], format: ReflectFormat) -> Result<()> {
-    if format == ReflectFormat::None {
-        return Ok(());
-    }
-
-    let candidates: Vec<&PathBuf> = written_files
-        .iter()
-        .filter(|path| {
-            path.extension().is_some_and(|ext| {
-                ext.eq_ignore_ascii_case("rdo") || ext.eq_ignore_ascii_case("bin")
-            })
-        })
-        .collect();
-
+/// Decompiles extracted reflection files (`.bin`/`.rdo`) to a `.txt` report and
+/// a `.rdo` source alongside each.
+fn decode_reflect_files(written_files: &[PathBuf]) {
     let mut decompiled = 0;
-    for path in &candidates {
+    for path in written_files.iter().filter(|p| {
+        p.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rdo") || e.eq_ignore_ascii_case("bin"))
+    }) {
         match decode_reflect_file(path) {
             Ok(true) => decompiled += 1,
             Ok(false) => {}
             Err(error) => eprintln!("failed to decompile '{}': {error:#}", path.display()),
         }
     }
-
     if decompiled > 0 {
         println!("Decompiled {decompiled} reflection file(s) to txt");
     }
-
-    Ok(())
 }
 
 fn decode_reflect_file(path: &Path) -> Result<bool> {
@@ -268,51 +156,30 @@ fn decode_reflect_file(path: &Path) -> Result<bool> {
     }
 }
 
-fn decode_rgd_files(written_files: &[PathBuf], format: RgdFormat) -> Result<()> {
-    let Some(extension) = format.extension() else {
-        return Ok(());
-    };
-
+/// Decodes extracted `.rgd` game-data files to `.xml` alongside each.
+fn decode_rgd_files(written_files: &[PathBuf]) {
     let rgd_paths: Vec<&PathBuf> = written_files
         .iter()
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("rgd"))
-        })
+        .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rgd")))
         .collect();
-
     if rgd_paths.is_empty() {
-        return Ok(());
+        return;
     }
 
     let mut failed = 0;
     for path in &rgd_paths {
-        if let Err(error) = decode_rgd_file(path, extension) {
+        if let Err(error) = decode_rgd_file(path) {
             eprintln!("failed to decode '{}': {error:#}", path.display());
             failed += 1;
         }
     }
-
-    println!(
-        "Decoded {} of {} .rgd files to {extension}",
-        rgd_paths.len() - failed,
-        rgd_paths.len()
-    );
-
-    Ok(())
+    println!("Decoded {} of {} .rgd files to xml", rgd_paths.len() - failed, rgd_paths.len());
 }
 
-fn decode_rgd_file(path: &Path, extension: &str) -> Result<()> {
+fn decode_rgd_file(path: &Path) -> Result<()> {
     let file = fs::File::open(path)?;
     let mut chunk_file = ChunkFile::parse(BufReader::new(file))?;
     let nodes = RelicGameData::parse(&mut chunk_file)?;
-
-    let encoded = match extension {
-        "json" => game_data_to_json(&nodes)?,
-        _ => game_data_to_xml(&nodes)?,
-    };
-
-    fs::write(path.with_extension(extension), encoded)?;
-
+    fs::write(path.with_extension("xml"), game_data_to_xml(&nodes)?)?;
     Ok(())
 }

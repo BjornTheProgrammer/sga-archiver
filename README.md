@@ -14,26 +14,31 @@ Click the releases tab, and then download and install the version you wish to us
 
 ## Usage
 
+Two commands:
+
+```
+Usage: sga-archiver <COMMAND>
+
+Commands:
+  pack    Compile a mod source directory into an .sga archive
+  unpack  Unpack an .sga archive into a directory
+```
+
 ### Unpack
 
-Run sga-archiver with an input archive and an output directory. It will be unpacked.
-
 ```
-Usage: sga-archiver [OPTIONS] --output <FILE> <INPUT>
-
-Arguments:
-  <INPUT>  Input archive to unpack, or mod source directory when --compile is set
-
-Options:
-  -o, --output <FILE>  Output folder (unpack) or output archive (compile)
-      --compile        Compile a mod source directory into an archive
-  -h, --help           Print help
-  -V, --version        Print version
+sga-archiver unpack <archive.sga> -o <out-dir>
 ```
 
-### Compile
+Extracts the archive, writing a `.aoe4mod` project file and decompiling reflection files (`.bin` → `.txt` + `.rdo`) and game data (`.rgd` → `.xml`) alongside the raw files.
 
-With `--compile`, the input is a mod source directory and the output is a packed `.sga`. The directory is expected to contain:
+### Pack
+
+```
+sga-archiver pack <mod-source-dir> -o <out.sga>
+```
+
+The input is a mod source directory. It is expected to contain:
 
 - `<mod>.aoe4mod` — the mod project file (its `<ID>` becomes the archive name)
 - `<mod>.burnproj` (under `assets/`) — the editor project; its `ReflectBurner` and `RRTextureBurner` rules tell the compiler which sources compile into which TOC
@@ -50,14 +55,10 @@ Reflection and texture artifacts are **compiled directly from their sources** �
 SHA1 hashes are generated and the archive is written unencrypted.
 
 ```
-sga-archiver "./My Mod" -o out.sga --compile
+sga-archiver pack "./My Mod" -o out.sga
 ```
 
-If a mod uses a reflection root type the tool doesn't yet bundle a schema for, regenerate the schema library from any existing `.bin`s and add it to `crates/relic-chunky/schemas/` (plus a match arm in `schema_lib.rs`):
-
-```
-sga-archiver ./some/prebuilt -o ./schemas --dump-schema-lib
-```
+If a mod uses a reflection root type the tool doesn't yet bundle a schema for, packing fails with `no bundled schema for root type '<Type>'`. Regenerate the schema resource from an existing `.bin` of that type with `relic_chunky::reflect_write::extract_schema`, drop the `<RootType>.schema` file into `crates/relic-chunky/schemas/`, and add a match arm in `schema_lib.rs`.
 
 ## Limitations
 This has only been verified to work with AOE4 sga files, if you are experiencing any issues with other game sga files, just submit an issue, it shouldn't be too hard to implement it.

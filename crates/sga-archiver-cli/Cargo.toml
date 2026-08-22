@@ -13,4 +13,3 @@ relic-chunky = { version = "0.1.0", path = "../relic-chunky" }
 
 clap = { workspace = true }
 anyhow = { workspace = true }
-serde_json.workspace = true
