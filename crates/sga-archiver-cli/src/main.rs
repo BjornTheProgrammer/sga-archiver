@@ -7,7 +7,7 @@ use std::{
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use relic_chunky::{
-    chunky::ChunkFile,
+    container::Chunky,
     decompile::DecompiledReflect,
     reflect::ReflectFile,
     rgd::{RelicGameData, game_data_to_xml},
@@ -137,17 +137,15 @@ fn decode_reflect_files(written_files: &[PathBuf]) {
 
 fn decode_reflect_file(path: &Path) -> Result<bool> {
     let file = fs::File::open(path)?;
-    let mut chunk_file = match ChunkFile::parse(BufReader::new(file)) {
-        Ok(chunk_file) => chunk_file,
+    let chunky = match Chunky::read(&mut BufReader::new(file)) {
+        Ok(chunky) => chunky,
         Err(_) => return Ok(false),
     };
 
-    match ReflectFile::parse(&mut chunk_file) {
+    match ReflectFile::parse(&chunky) {
         Some(reflect) => {
             fs::write(path.with_extension("txt"), reflect.to_report())?;
-            let file = fs::File::open(path)?;
-            let mut chunk_file = ChunkFile::parse(BufReader::new(file))?;
-            if let Some(decompiled) = DecompiledReflect::parse(&mut chunk_file) {
+            if let Some(decompiled) = DecompiledReflect::parse(&chunky) {
                 fs::write(path.with_extension("rdo"), decompiled.to_rdo_xml())?;
             }
             Ok(true)
@@ -178,8 +176,8 @@ fn decode_rgd_files(written_files: &[PathBuf]) {
 
 fn decode_rgd_file(path: &Path) -> Result<()> {
     let file = fs::File::open(path)?;
-    let mut chunk_file = ChunkFile::parse(BufReader::new(file))?;
-    let nodes = RelicGameData::parse(&mut chunk_file)?;
+    let chunky = Chunky::read(&mut BufReader::new(file))?;
+    let nodes = RelicGameData::parse(&chunky)?;
     fs::write(path.with_extension("xml"), game_data_to_xml(&nodes)?)?;
     Ok(())
 }

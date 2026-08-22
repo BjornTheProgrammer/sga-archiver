@@ -1,4 +1,3 @@
-pub mod chunky;
 pub mod container;
 pub mod hash;
 pub mod decompile;

@@ -139,6 +139,35 @@ impl Chunky {
         }
         Ok(())
     }
+
+    /// Every `Data` chunk in the tree, depth-first in file order, paired with the
+    /// absolute file offset where its body begins. The layout is contiguous, so
+    /// these positions are computed from chunk sizes — matching what the flat
+    /// reader used to expose for reflection/RGD offset math.
+    pub fn data_chunks(&self) -> Vec<(&Chunk, u64)> {
+        let mut out = Vec::new();
+        collect_data_chunks(&self.chunks, FILE_HEADER_LEN, &mut out);
+        out
+    }
+}
+
+/// Size of the Relic Chunky file header (16-byte magic + major/minor/platform).
+const FILE_HEADER_LEN: u64 = 24;
+/// Fixed part of a chunk header: kind, name, version, length, path length.
+const CHUNK_HEADER_FIXED: u64 = 20;
+
+fn collect_data_chunks<'a>(chunks: &'a [Chunk], mut pos: u64, out: &mut Vec<(&'a Chunk, u64)>) -> u64 {
+    for chunk in chunks {
+        let body_pos = pos + CHUNK_HEADER_FIXED + chunk.path.len() as u64;
+        pos = match &chunk.body {
+            ChunkBody::Data(data) => {
+                out.push((chunk, body_pos));
+                body_pos + data.len() as u64
+            }
+            ChunkBody::Folder(children) => collect_data_chunks(children, body_pos, out),
+        };
+    }
+    pos
 }
 
 fn read_chunks<R: Read + Seek>(reader: &mut R, limit: u64) -> Result<Vec<Chunk>> {

@@ -1,8 +1,8 @@
 
 use std::collections::HashMap;
-use std::io::{BufRead, Read, Seek};
 
-use crate::chunky::{ChunkFile, ChunkType};
+use crate::container::Chunky;
+use crate::reflect_type::{parse_type, FieldDef, TypeDef};
 
 fn u32_at(b: &[u8], off: usize) -> Option<u32> {
     b.get(off..off + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
@@ -12,24 +12,6 @@ fn i32_at(b: &[u8], off: usize) -> Option<i32> {
 }
 fn u64_at(b: &[u8], off: usize) -> Option<u64> {
     b.get(off..off + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
-}
-
-#[derive(Debug, Clone)]
-pub struct Field {
-    pub name: String,
-    pub type_name: String,
-    pub offset: usize,
-    pub size: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeDef {
-    pub name: String,
-    pub hash: u64,
-    pub size: usize,
-    pub fields: Vec<Field>,
-    pub bases: Vec<(u64, u32)>,
-    header_region: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,79 +30,6 @@ pub struct DecompiledReflect {
     pub rfci_offset: usize,
     pub interned: HashMap<u64, String>,
     pub root_id: u64,
-}
-
-fn is_type_token(s: &str) -> bool {
-    let first = match s.chars().next() {
-        Some(c) => c,
-        None => return false,
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '<' | '>' | ',' | '*' | ' '))
-}
-
-fn read_pascal(bytes: &[u8], off: usize) -> Option<(String, usize)> {
-    let len = u32_at(bytes, off)? as usize;
-    if len == 0 || len > 512 || off + 4 + len > bytes.len() {
-        return None;
-    }
-    let s = &bytes[off + 4..off + 4 + len];
-    if s.iter().all(|&c| (0x20..=0x7e).contains(&c)) {
-        Some((String::from_utf8_lossy(s).into_owned(), off + 4 + len))
-    } else {
-        None
-    }
-}
-
-fn parse_type(bytes: &[u8]) -> Option<TypeDef> {
-    let (name, after_name) = read_pascal(bytes, 0)?;
-    let hash = u64_at(bytes, after_name)?;
-    let size = u32_at(bytes, after_name + 8).unwrap_or(0) as usize;
-
-    let mut fields = Vec::new();
-    let mut first_field_off = bytes.len();
-    let mut i = after_name;
-    while i + 4 < bytes.len() {
-        match read_pascal(bytes, i) {
-            Some((s, end)) if s.starts_with("m_") => {
-                first_field_off = first_field_off.min(i);
-                let after_name_hash = end + 8;
-                match read_pascal(bytes, after_name_hash) {
-                    Some((t, tend))
-                        if is_type_token(&t) && !t.starts_with("m_") =>
-                    {
-                        let after_type_hash = tend + 8;
-                        let offset = u32_at(bytes, after_type_hash).unwrap_or(0) as usize;
-                        let fsize = u32_at(bytes, after_type_hash + 4).unwrap_or(0) as usize;
-                        fields.push(Field {
-                            name: s,
-                            type_name: t,
-                            offset,
-                            size: fsize,
-                        });
-                        i = after_type_hash + 8;
-                    }
-                    _ => i = end,
-                }
-            }
-            _ => i += 1,
-        }
-    }
-
-    let header_start = (after_name + 12).min(bytes.len());
-    let header_region = bytes.get(header_start..first_field_off).unwrap_or(&[]).to_vec();
-
-    Some(TypeDef {
-        name,
-        hash,
-        size,
-        fields,
-        bases: Vec::new(),
-        header_region,
-    })
 }
 
 fn parse_objects(bytes: &[u8]) -> Vec<ObjectRef> {
@@ -163,47 +72,31 @@ fn parse_interned(bytes: &[u8]) -> HashMap<u64, String> {
 }
 
 impl DecompiledReflect {
-    pub fn parse<R: Read + BufRead + Seek>(chunk_file: &mut ChunkFile<R>) -> Option<DecompiledReflect> {
-        let all = crate::rgd::RelicGameData::flatten_data_chunks(
-            &mut chunk_file.reader,
-            &chunk_file.chunks,
-        )
-        .ok()?;
-
-        let headers: Vec<_> = all
-            .iter()
-            .filter(|c| c.chunk_type == ChunkType::Data)
-            .cloned()
-            .collect();
-
+    pub fn parse(chunky: &Chunky) -> Option<DecompiledReflect> {
         let mut out = DecompiledReflect::default();
         let mut saw_type = false;
 
-        for chunk in &headers {
-            let Ok(data) = chunk_file.extract_chunk_data(chunk) else {
-                continue;
-            };
-            match chunk.name.as_str() {
+        for (chunk, position) in chunky.data_chunks() {
+            let Some(data) = chunk.data() else { continue };
+            match chunk.name_str().as_str() {
                 "RFTY" => {
-                    if let Some(ty) = parse_type(&data) {
+                    if let Some(ty) = parse_type(data) {
                         saw_type = true;
                         out.types.insert(ty.hash, ty);
                     }
                 }
-                "ROBJ" => out.objects = parse_objects(&data),
+                "ROBJ" => out.objects = parse_objects(data),
                 "RFCI" => {
-                    out.rfci_offset = chunk.data_position_start as usize;
-                    out.data = data;
+                    out.rfci_offset = position as usize;
+                    out.data = data.to_vec();
                 }
-                "RSHI" => out.interned = parse_interned(&data),
+                "RSHI" => out.interned = parse_interned(data),
                 "RNEW" => {
-                    out.root_id = u64_at(&data, 8).unwrap_or(0);
+                    out.root_id = u64_at(data, 8).unwrap_or(0);
                 }
                 _ => {}
             }
         }
-
-        out.resolve_bases();
 
         if let Some(root) = out.objects.iter().find(|o| o.owner_id == 0) {
             out.root_id = root.id;
@@ -240,40 +133,6 @@ impl DecompiledReflect {
         match self.data.get(start..start + len) {
             Some(b) => String::from_utf8_lossy(b).into_owned(),
             None => String::new(),
-        }
-    }
-
-    fn resolve_bases(&mut self) {
-        let known: std::collections::HashSet<u64> = self.types.keys().copied().collect();
-        let mut resolved: HashMap<u64, Vec<(u64, u32)>> = HashMap::new();
-
-        for ty in self.types.values() {
-            let region = &ty.header_region;
-            let mut bases = Vec::new();
-            let mut i = 0;
-            while i + 8 <= region.len() {
-                let candidate = u64::from_le_bytes(region[i..i + 8].try_into().unwrap());
-                if candidate != ty.hash && known.contains(&candidate) {
-                    let index = if i >= 4 {
-                        u32::from_le_bytes(region[i - 4..i].try_into().unwrap())
-                    } else {
-                        0
-                    };
-                    bases.push((candidate, index));
-                    i += 8;
-                } else {
-                    i += 1;
-                }
-            }
-            if !bases.is_empty() {
-                resolved.insert(ty.hash, bases);
-            }
-        }
-
-        for (hash, bases) in resolved {
-            if let Some(ty) = self.types.get_mut(&hash) {
-                ty.bases = bases;
-            }
         }
     }
 
@@ -342,13 +201,13 @@ impl DecompiledReflect {
         &self,
         parent: &ObjectRef,
         base: usize,
-        field: &Field,
+        field: &FieldDef,
         depth: usize,
         used: &mut [bool],
         out: &mut String,
     ) {
         let tab = "\t".repeat(depth);
-        let pos = base + field.offset;
+        let pos = base + field.offset as usize;
         let t = field.type_name.as_str();
 
         if let Some((xml_type, value)) = self.scalar(pos, t) {

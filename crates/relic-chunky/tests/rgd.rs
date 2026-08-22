@@ -1,15 +1,15 @@
-use std::io::{BufReader, Cursor};
+use std::io::Cursor;
 
 use relic_chunky::{
-    chunky::ChunkFile,
+    container::Chunky,
     rgd::{RGDNode, RGDNodeValue, RelicGameData, game_data_to_json, game_data_to_xml},
 };
 
 const FIXTURE: &[u8] = include_bytes!("weapon_war_elephant_spear_3_sul.rgd");
 
 fn parse_fixture() -> Vec<RGDNode> {
-    let mut chunk_file = ChunkFile::parse(BufReader::new(Cursor::new(FIXTURE))).unwrap();
-    RelicGameData::parse(&mut chunk_file).unwrap()
+    let chunky = Chunky::read(&mut Cursor::new(FIXTURE)).unwrap();
+    RelicGameData::parse(&chunky).unwrap()
 }
 
 fn child<'a>(nodes: &'a [RGDNode], key: &str) -> &'a RGDNode {
@@ -168,6 +168,6 @@ fn missing_keys_chunk_is_an_error() {
     bytes.extend_from_slice(&1u16.to_le_bytes()); // minor
     bytes.extend_from_slice(&1u32.to_le_bytes()); // platform
 
-    let mut chunk_file = ChunkFile::parse(BufReader::new(Cursor::new(bytes))).unwrap();
-    assert!(RelicGameData::parse(&mut chunk_file).is_err());
+    let chunky = Chunky::read(&mut Cursor::new(bytes)).unwrap();
+    assert!(RelicGameData::parse(&chunky).is_err());
 }

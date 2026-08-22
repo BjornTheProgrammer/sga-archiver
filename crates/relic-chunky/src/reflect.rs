@@ -1,7 +1,5 @@
 
-use std::io::{BufRead, Read, Seek};
-
-use crate::chunky::{ChunkFile, ChunkType};
+use crate::container::Chunky;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflectType {
@@ -151,35 +149,21 @@ pub fn parse_rshi_for_test(bytes: &[u8]) -> Vec<InternedString> {
 }
 
 impl ReflectFile {
-    pub fn parse<R: Read + BufRead + Seek>(chunk_file: &mut ChunkFile<R>) -> Option<ReflectFile> {
-        let all = crate::rgd::RelicGameData::flatten_data_chunks(
-            &mut chunk_file.reader,
-            &chunk_file.chunks,
-        )
-        .ok()?;
-
+    pub fn parse(chunky: &Chunky) -> Option<ReflectFile> {
         let mut file = ReflectFile::default();
         let mut saw_rfty = false;
 
-        let headers: Vec<_> = all
-            .iter()
-            .filter(|c| c.chunk_type == ChunkType::Data)
-            .cloned()
-            .collect();
-
-        for chunk in &headers {
-            let Ok(data) = chunk_file.extract_chunk_data(chunk) else {
-                continue;
-            };
-            match chunk.name.as_str() {
+        for (chunk, _position) in chunky.data_chunks() {
+            let Some(data) = chunk.data() else { continue };
+            match chunk.name_str().as_str() {
                 "RFTY" => {
                     saw_rfty = true;
-                    if let Some(ty) = parse_rfty(&data) {
+                    if let Some(ty) = parse_rfty(data) {
                         file.types.push(ty);
                     }
                 }
-                "RSHI" => file.interned_strings = parse_rshi(&data),
-                "RFCI" => file.object_strings = packed_strings(&data, 6),
+                "RSHI" => file.interned_strings = parse_rshi(data),
+                "RFCI" => file.object_strings = packed_strings(data, 6),
                 _ => {}
             }
         }

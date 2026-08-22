@@ -23,6 +23,10 @@ pub struct TypeDef {
     pub size: u32,
     pub trailer: u32,
     pub fields: Vec<FieldDef>,
+    /// Base types this type derives from, as `(type hash, index)`. Empty for
+    /// types with no bases (or non-struct kinds).
+    #[serde(default)]
+    pub bases: Vec<(u64, u32)>,
 }
 
 /// A forward-only cursor over a chunk payload. Every read advances the
@@ -80,7 +84,6 @@ impl<'a> ByteReader<'a> {
 /// the bases only need to be skipped, not modelled.
 const AFTER_SIZE_TO_TRAILER: usize = 12;
 const AFTER_TRAILER_TO_BASE_COUNT: usize = 20;
-const BASE_ENTRY_LEN: usize = 12;
 const AFTER_BASES_TO_FIELD_COUNT: usize = 24;
 
 /// Each field record: name (pascal), its hash, the field type name, that type's
@@ -103,9 +106,15 @@ pub fn parse_type(payload: &[u8]) -> Option<TypeDef> {
 
     let base_count = cursor.u64()?;
     if base_count > MAX_COUNT {
-        return Some(TypeDef { name, hash, size, trailer, fields: Vec::new() });
+        return Some(TypeDef { name, hash, size, trailer, fields: Vec::new(), bases: Vec::new() });
     }
-    cursor.skip(base_count as usize * BASE_ENTRY_LEN)?;
+    // Each base entry is `[u64 hash][u32 index]` (12 bytes).
+    let mut bases = Vec::with_capacity(base_count as usize);
+    for _ in 0..base_count {
+        let hash = cursor.u64()?;
+        let index = cursor.u32()?;
+        bases.push((hash, index));
+    }
     cursor.skip(AFTER_BASES_TO_FIELD_COUNT)?;
 
     let field_count = cursor.u64()?;
@@ -128,6 +137,7 @@ pub fn parse_type(payload: &[u8]) -> Option<TypeDef> {
         size,
         trailer,
         fields,
+        bases,
     })
 }
 

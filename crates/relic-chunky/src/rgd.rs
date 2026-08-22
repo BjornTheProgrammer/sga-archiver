@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::{self, BufRead, Read, Seek, SeekFrom},
+    io::{self, Cursor, Read, Seek, SeekFrom},
 };
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -11,7 +11,7 @@ use quick_xml::{
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::chunky::{ChunkFile, ChunkHeader, ChunkType};
+use crate::container::Chunky;
 
 #[derive(Debug)]
 pub struct RelicGameData {}
@@ -20,9 +20,6 @@ pub struct RelicGameData {}
 pub enum RelicGameDataError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-
-    #[error("chunk parse error: {0}")]
-    Chunk(#[from] crate::chunky::DataStoreError),
 
     #[error("No DATA KEYS chunk present")]
     MissingDataKeysChunk,
@@ -114,84 +111,35 @@ pub struct RGDNode {
 }
 
 impl RelicGameData {
-    pub fn parse<R: Read + BufRead + Seek>(
-        chunk_file: &mut ChunkFile<R>,
-    ) -> Result<Vec<RGDNode>, RelicGameDataError> {
-        let all_chunks = Self::flatten_data_chunks(&mut chunk_file.reader, &chunk_file.chunks)?;
+    pub fn parse(chunky: &Chunky) -> Result<Vec<RGDNode>, RelicGameDataError> {
+        let mut keys_data = None;
+        let mut aegd_data = None;
 
-        let mut keys_chunk_header = None;
-        let mut kvs_chunk_header = None;
-
-        for chunk in &all_chunks {
-            if chunk.chunk_type == ChunkType::Data {
-                if chunk.name == "KEYS" {
-                    if keys_chunk_header.is_some() {
+        for (chunk, _position) in chunky.data_chunks() {
+            match chunk.name_str().as_str() {
+                "KEYS" => {
+                    if keys_data.is_some() {
                         return Err(RelicGameDataError::MultipleDataKeysChunks);
                     }
-                    keys_chunk_header = Some(chunk);
-                } else if chunk.name == "AEGD" {
-                    if kvs_chunk_header.is_some() {
+                    keys_data = chunk.data();
+                }
+                "AEGD" => {
+                    if aegd_data.is_some() {
                         return Err(RelicGameDataError::MultipleDataAegdChunks);
                     }
-                    kvs_chunk_header = Some(chunk);
+                    aegd_data = chunk.data();
                 }
+                _ => {}
             }
         }
 
-        let keys_chunk_header = match keys_chunk_header {
-            Some(keys) => keys,
-            None => return Err(RelicGameDataError::MissingDataKeysChunk),
-        };
+        let keys_data = keys_data.ok_or(RelicGameDataError::MissingDataKeysChunk)?;
+        let aegd_data = aegd_data.ok_or(RelicGameDataError::MissingDataAegdChunk)?;
 
-        let kvs_chunk_header = match kvs_chunk_header {
-            Some(kvs) => kvs,
-            None => return Err(RelicGameDataError::MissingDataAegdChunk),
-        };
-
-        let keys = Self::parse_keys(&mut chunk_file.reader, keys_chunk_header)?;
-        let entries = Self::parse_aegd(&mut chunk_file.reader, kvs_chunk_header)?;
+        let keys = Self::parse_keys(keys_data)?;
+        let entries = Self::parse_aegd(aegd_data)?;
 
         Ok(Self::resolve_nodes(&entries, &keys))
-    }
-
-    pub fn flatten_data_chunks<R: Read + Seek>(
-        reader: &mut R,
-        chunks: &[ChunkHeader],
-    ) -> Result<Vec<ChunkHeader>, RelicGameDataError> {
-        let mut out = Vec::new();
-        for chunk in chunks {
-            if chunk.chunk_type == ChunkType::Folder {
-                let end = chunk.data_position_start + chunk.length as u64;
-                reader.seek(SeekFrom::Start(chunk.data_position_start))?;
-                let children = Self::read_chunk_headers_bounded(reader, end)?;
-                let nested = Self::flatten_data_chunks(reader, &children)?;
-                out.push(chunk.clone());
-                out.extend(nested);
-            } else {
-                out.push(chunk.clone());
-            }
-        }
-        Ok(out)
-    }
-
-    fn read_chunk_headers_bounded<R: Read + Seek>(
-        reader: &mut R,
-        end: u64,
-    ) -> Result<Vec<ChunkHeader>, RelicGameDataError> {
-        let mut chunks = Vec::new();
-        loop {
-            let position = reader.stream_position()?;
-            if position >= end {
-                break;
-            }
-
-            let chunk_header = ChunkHeader::parse(&mut *reader)?;
-            reader.seek(SeekFrom::Start(
-                chunk_header.data_position_start + chunk_header.length as u64,
-            ))?;
-            chunks.push(chunk_header);
-        }
-        Ok(chunks)
     }
 
     fn read_chunky_list<R: Read + Seek>(
@@ -278,21 +226,15 @@ impl RelicGameData {
         Ok(String::from_utf16_lossy(&units))
     }
 
-    fn parse_aegd<R: Read + Seek>(
-        reader: &mut R,
-        chunk: &ChunkHeader,
-    ) -> Result<Vec<RGDEntry>, RelicGameDataError> {
-        reader.seek(SeekFrom::Start(chunk.data_position_start))?;
+    fn parse_aegd(data: &[u8]) -> Result<Vec<RGDEntry>, RelicGameDataError> {
+        let mut reader = Cursor::new(data);
         let _unknown = reader.read_u32::<LittleEndian>()?;
-        Self::read_chunky_list(reader)
+        Self::read_chunky_list(&mut reader)
     }
 
-    pub fn parse_keys<R: Read + Seek>(
-        reader: &mut R,
-        chunk: &ChunkHeader,
-    ) -> Result<HashMap<u64, String>, RelicGameDataError> {
+    pub fn parse_keys(data: &[u8]) -> Result<HashMap<u64, String>, RelicGameDataError> {
         let mut key_string_map = HashMap::new();
-        reader.seek(SeekFrom::Start(chunk.data_position_start))?;
+        let mut reader = Cursor::new(data);
 
         let count = reader.read_u32::<LittleEndian>()?;
 

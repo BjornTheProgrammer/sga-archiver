@@ -1,13 +1,13 @@
 
-use std::io::{BufReader, Cursor};
+use std::io::Cursor;
 
-use relic_chunky::{chunky::ChunkFile, decompile::DecompiledReflect};
+use relic_chunky::{container::Chunky, decompile::DecompiledReflect};
 
 const MOD_BIN: &[u8] = include_bytes!("mod.bin");
 
 fn decompile(bytes: &'static [u8]) -> DecompiledReflect {
-    let mut cf = ChunkFile::parse(BufReader::new(Cursor::new(bytes))).unwrap();
-    DecompiledReflect::parse(&mut cf).expect("reflection file")
+    let chunky = Chunky::read(&mut Cursor::new(bytes)).unwrap();
+    DecompiledReflect::parse(&chunky).expect("reflection file")
 }
 
 #[test]
