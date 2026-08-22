@@ -61,6 +61,10 @@ struct Cli {
     /// files under the input directory, into the output directory.
     #[arg(long)]
     dump_schema_lib: bool,
+
+    /// Compile a single PNG (input) into a Relic `.rrtex` texture (output).
+    #[arg(long)]
+    compile_texture: bool,
 }
 
 fn main() -> Result<()> {
@@ -83,6 +87,20 @@ fn main() -> Result<()> {
     if cli.dump_schema_lib {
         let count = dump_schema_lib(&cli.input, &cli.output)?;
         println!("Wrote {count} schema resource(s) -> {}", cli.output.display());
+        return Ok(());
+    }
+
+    if cli.compile_texture {
+        let png = fs::read(&cli.input)?;
+        let name = cli.input.file_stem().and_then(|s| s.to_str()).unwrap_or("texture");
+        let rrtex = relic_chunky::texture::compile_texture(&png, name)?;
+        fs::write(&cli.output, &rrtex)?;
+        println!(
+            "Compiled {} into {} ({} bytes)",
+            cli.input.display(),
+            cli.output.display(),
+            rrtex.len()
+        );
         return Ok(());
     }
 

@@ -6,3 +6,4 @@ pub mod reflect_type;
 pub mod reflect_write;
 pub mod rgd;
 pub mod schema_lib;
+pub mod texture;

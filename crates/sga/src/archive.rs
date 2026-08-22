@@ -408,10 +408,12 @@ impl Archive {
             }
         }
 
-        // Compile reflection `.rdo` sources into `.bin`s per the burnproj's
-        // ReflectBurner rules, so the mod tree needs no compiled `.bin`.
+        // Compile reflection `.rdo` and texture `.png` sources per the
+        // burnproj's ReflectBurner / RRTextureBurner rules, so the mod tree
+        // needs no compiled `.bin` or `.rrtex`.
         if assets.is_dir() {
             add_reflection_bins(&mut tocs, &assets)?;
+            add_texture_bins(&mut tocs, &assets)?;
         }
 
         Ok(Archive {
@@ -426,21 +428,28 @@ impl Archive {
     }
 }
 
-/// A `ReflectBurner` rule from a `.burnproj`: which `.rdo` sources (glob
-/// patterns) compile into which TOC (alias).
-struct ReflectRule {
+/// A `.burnproj` `BurnRule`: which source globs compile into which TOC (alias).
+struct BurnRule {
     alias: String,
     includes: Vec<String>,
 }
 
-/// Compiles every `.rdo` under `assets` that a `ReflectBurner` rule selects
-/// into a `.bin`, placing it in the rule's TOC. The output path mirrors the
-/// `.rdo`'s location with a lower-cased `.bin` name, matching the editor.
-fn add_reflection_bins(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
+/// Compiles every source file under `assets` selected by a rule for `burner`
+/// into the rule's TOC. `source_ext` filters the sources; the output keeps the
+/// same relative directory with a lower-cased `<stem>.<out_ext>` name (matching
+/// the editor). `compile` turns `(path, stem)` into the output bytes.
+fn add_burned_files(
+    tocs: &mut Vec<Toc>,
+    assets: &Path,
+    burner: &str,
+    source_ext: &str,
+    out_ext: &str,
+    compile: impl Fn(&Path, &str) -> Result<Vec<u8>>,
+) -> Result<()> {
     let Some(burnproj) = find_burnproj(assets) else {
         return Ok(());
     };
-    let rules = parse_reflect_rules(&std::fs::read_to_string(&burnproj)?);
+    let rules = parse_burn_rules(&std::fs::read_to_string(&burnproj)?, burner);
     if rules.is_empty() {
         return Ok(());
     }
@@ -455,7 +464,7 @@ fn add_reflection_bins(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
                 stack.push(path);
                 continue;
             }
-            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rdo")) {
+            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case(source_ext)) {
                 continue;
             }
             let rel = path.strip_prefix(assets).unwrap_or(&path).to_path_buf();
@@ -467,16 +476,33 @@ fn add_reflection_bins(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
                 continue;
             };
 
-            let rdo_xml = std::fs::read_to_string(&path)?;
-            let bin = relic_chunky::reflect_write::compile_bin(&rdo_xml)
-                .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))?;
-            let out_rel = reflect_output_path(&rel);
-            let file = stored_file(&out_rel, bin);
+            let stem = rel.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let bytes = compile(&path, &stem)?;
+            let out_rel = burned_output_path(&rel, out_ext);
+            let file = stored_file(&out_rel, bytes);
             let toc = get_or_create_toc(tocs, &rule.alias);
             insert_or_replace(&mut toc.root, &out_rel, file);
         }
     }
     Ok(())
+}
+
+/// Compiles reflection `.rdo` sources into `.bin`s (the `ReflectBurner`).
+fn add_reflection_bins(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
+    add_burned_files(tocs, assets, "ReflectBurner", "rdo", "bin", |path, _stem| {
+        let rdo_xml = std::fs::read_to_string(path)?;
+        relic_chunky::reflect_write::compile_bin(&rdo_xml)
+            .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
+    })
+}
+
+/// Compiles PNG sources into `.rrtex` textures (the `RRTextureBurner`).
+fn add_texture_bins(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
+    add_burned_files(tocs, assets, "RRTextureBurner", "png", "rrtex", |path, stem| {
+        let png = std::fs::read(path)?;
+        relic_chunky::texture::compile_texture(&png, stem)
+            .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
+    })
 }
 
 fn find_burnproj(assets: &Path) -> Option<PathBuf> {
@@ -489,11 +515,11 @@ fn find_burnproj(assets: &Path) -> Option<PathBuf> {
 
 /// Extracts the `ReflectBurner` rules from a `.burnproj` by lightweight tag
 /// scanning (no XML dependency needed for its simple structure).
-fn parse_reflect_rules(xml: &str) -> Vec<ReflectRule> {
+fn parse_burn_rules(xml: &str, burner: &str) -> Vec<BurnRule> {
     let mut rules = Vec::new();
     for block in xml.split("<BurnRule>").skip(1) {
         let block = block.split_once("</BurnRule>").map(|(b, _)| b).unwrap_or(block);
-        if tag_value(block, "Burner").as_deref() != Some("ReflectBurner") {
+        if tag_value(block, "Burner").as_deref() != Some(burner) {
             continue;
         }
         let alias = tag_value(block, "Alias").unwrap_or_default();
@@ -505,7 +531,7 @@ fn parse_reflect_rules(xml: &str) -> Vec<ReflectRule> {
             .map(str::to_string)
             .collect();
         if !alias.is_empty() && !includes.is_empty() {
-            rules.push(ReflectRule { alias, includes });
+            rules.push(BurnRule { alias, includes });
         }
     }
     rules
@@ -519,15 +545,15 @@ fn tag_value(block: &str, tag: &str) -> Option<String> {
     Some(block[start..end].to_string())
 }
 
-/// The archive path for a compiled `.rdo`: same directory, lower-cased stem,
-/// `.bin` extension.
-fn reflect_output_path(rel: &Path) -> PathBuf {
+/// The archive path for a burned source: same directory, lower-cased stem, and
+/// the burner's output extension.
+fn burned_output_path(rel: &Path, ext: &str) -> PathBuf {
     let stem = rel
         .file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     let mut out = rel.to_path_buf();
-    out.set_file_name(format!("{stem}.bin"));
+    out.set_file_name(format!("{stem}.{ext}"));
     out
 }
 
@@ -566,27 +592,9 @@ fn get_or_create_toc<'a>(tocs: &'a mut Vec<Toc>, alias: &str) -> &'a mut Toc {
 }
 
 /// Inserts `file` at `rel` under `root`, replacing any file already there.
-fn insert_or_replace(root: &mut Folder, rel: &Path, file: FileEntry) {
-    let mut folder = root;
-    if let Some(parent) = rel.parent() {
-        for comp in parent.components() {
-            if let std::path::Component::Normal(os) = comp {
-                let name = os.to_string_lossy().into_owned();
-                let idx = match folder.folders.iter().position(|f| f.name == name) {
-                    Some(i) => i,
-                    None => {
-                        folder.folders.push(Folder {
-                            name,
-                            folders: Vec::new(),
-                            files: Vec::new(),
-                        });
-                        folder.folders.len() - 1
-                    }
-                };
-                folder = &mut folder.folders[idx];
-            }
-        }
-    }
+fn insert_or_replace(root: &mut Folder, rel: &Path, mut file: FileEntry) {
+    file.name = file.name.to_lowercase();
+    let folder = descend(root, rel);
     match folder.files.iter().position(|f| f.name == file.name) {
         Some(i) => folder.files[i] = file,
         None => folder.files.push(file),
@@ -720,12 +728,22 @@ fn add_source_files(
     Ok(())
 }
 
-fn insert_file(root: &mut Folder, rel: &Path, file: FileEntry) {
+fn insert_file(root: &mut Folder, rel: &Path, mut file: FileEntry) {
+    // AoE4 archives use all-lowercase paths; the engine lowercases lookups, so
+    // a mixed-case entry (e.g. a win condition's `.scar`) would never be found.
+    file.name = file.name.to_lowercase();
+    let folder = descend(root, rel);
+    folder.files.push(file);
+}
+
+/// Walks/creates the (lower-cased) folder chain for `rel`'s parent, returning
+/// the folder its file belongs in.
+fn descend<'a>(root: &'a mut Folder, rel: &Path) -> &'a mut Folder {
     let mut folder = root;
     if let Some(parent) = rel.parent() {
         for comp in parent.components() {
             if let std::path::Component::Normal(os) = comp {
-                let name = os.to_string_lossy().into_owned();
+                let name = os.to_string_lossy().to_lowercase();
                 let idx = match folder.folders.iter().position(|f| f.name == name) {
                     Some(i) => i,
                     None => {
@@ -741,7 +759,7 @@ fn insert_file(root: &mut Folder, rel: &Path, file: FileEntry) {
             }
         }
     }
-    folder.files.push(file);
+    folder
 }
 
 fn encode(data: &[u8], storage: &FileStorageType) -> Result<Vec<u8>> {
