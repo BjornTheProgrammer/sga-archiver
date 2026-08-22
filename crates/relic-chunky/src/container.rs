@@ -1,9 +1,60 @@
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use anyhow::{bail, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 const MAGIC: &[u8; 16] = b"Relic Chunky\r\n\x1a\0";
+
+/// Rewrites length-prefixed ASCII string tokens inside every `DATA` payload of a
+/// Relic Chunky. Each `(old, new)` is matched as `[u32 len][bytes]` and swapped;
+/// chunk and folder lengths are recomputed on re-serialization. Returns the new
+/// bytes and the number of tokens replaced. This is how a base-path reference
+/// (e.g. `art\scenario\eng_house_age2\eng_house_age2`) is retargeted without
+/// hand-fixing the container's length fields.
+pub fn replace_length_prefixed_strings(bytes: &[u8], subs: &[(&str, &str)]) -> Result<(Vec<u8>, usize)> {
+    let mut chunky = Chunky::read(&mut Cursor::new(bytes))?;
+    let tokens: Vec<(Vec<u8>, Vec<u8>)> =
+        subs.iter().map(|(o, n)| (length_prefixed(o), length_prefixed(n))).collect();
+    let mut count = 0;
+    for chunk in &mut chunky.chunks {
+        count += patch_tokens(chunk, &tokens);
+    }
+    let mut out = Vec::new();
+    chunky.write(&mut out)?;
+    Ok((out, count))
+}
+
+fn length_prefixed(s: &str) -> Vec<u8> {
+    let mut v = (s.len() as u32).to_le_bytes().to_vec();
+    v.extend_from_slice(s.as_bytes());
+    v
+}
+
+fn patch_tokens(chunk: &mut Chunk, tokens: &[(Vec<u8>, Vec<u8>)]) -> usize {
+    match &mut chunk.body {
+        ChunkBody::Folder(children) => children.iter_mut().map(|c| patch_tokens(c, tokens)).sum(),
+        ChunkBody::Data(data) => {
+            let mut n = 0;
+            for (old, new) in tokens {
+                let mut from = 0;
+                while let Some(pos) = find_sub(&data[from..], old) {
+                    let at = from + pos;
+                    data.splice(at..at + old.len(), new.iter().copied());
+                    from = at + new.len();
+                    n += 1;
+                }
+            }
+            n
+        }
+    }
+}
+
+fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkKind {

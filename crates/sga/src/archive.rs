@@ -159,7 +159,6 @@ impl Archive {
         let mut file_entries: Vec<SgaFileEntry> = Vec::new();
         let mut data_blob: Vec<u8> = Vec::new();
         let mut hash_blob: Vec<u8> = Vec::new();
-        let mut hash_offsets: HashMap<Vec<u8>, u32> = HashMap::new();
 
         // The string blob is emitted depth-first (each folder's full path, then
         // its file names, then its children recursively) with no deduplication —
@@ -212,7 +211,6 @@ impl Archive {
                 &file_str,
                 &file_data_off,
                 &mut hash_blob,
-                &mut hash_offsets,
                 block_size,
             );
             toc_file_ranges.push((start, file_entries.len() as u32));
@@ -229,55 +227,30 @@ impl Archive {
             base = counter;
         }
 
-        // Folder table: breadth-first, referencing the depth-first file ranges
-        // and the folder ranges computed above.
+        // Folder table: emitted so each folder's children occupy the contiguous
+        // index block named by `folder_range` — a node writes its children as a
+        // block, then recurses into each child depth-first. The range values were
+        // computed with this same traversal (`dfs_folder_ranges`), so the array
+        // order and the start/end indices agree. A plain breadth-first emission
+        // instead misaligns sibling branches of unequal depth.
         for (ti, toc) in self.tocs.iter().enumerate() {
             let toc_folder_start = folder_entries.len() as u32;
             let root_index = folder_entries.len() as u32;
 
-            let root_entry_index = folder_entries.len();
-            folder_entries.push(SgaFolderEntry {
-                name_offset: folder_str[&(ti, String::new())],
-                folder_start_index: 0,
-                folder_end_index: 0,
-                file_start_index: 0,
-                file_end_index: 0,
-            });
-
-            let mut queue: VecDeque<(usize, &Folder, String)> = VecDeque::new();
-            queue.push_back((root_entry_index, &toc.root, String::new()));
-
-            while let Some((idx, folder, full)) = queue.pop_front() {
-                let (file_start, file_end) = folder_file_range[&(ti, full.clone())];
-                let (folder_start, folder_end) = folder_range[&(ti, full.clone())];
-
-                let mut children: Vec<(usize, &Folder, String)> = Vec::new();
-                for child in &folder.folders {
-                    let child_full = if full.is_empty() {
-                        child.name.clone()
-                    } else {
-                        format!("{}\\{}", full, child.name)
-                    };
-                    let cidx = folder_entries.len();
-                    folder_entries.push(SgaFolderEntry {
-                        name_offset: folder_str[&(ti, child_full.clone())],
-                        folder_start_index: 0,
-                        folder_end_index: 0,
-                        file_start_index: 0,
-                        file_end_index: 0,
-                    });
-                    children.push((cidx, child, child_full));
+            let mk = |full: &str| {
+                let (folder_start, folder_end) = folder_range[&(ti, full.to_string())];
+                let (file_start, file_end) = folder_file_range[&(ti, full.to_string())];
+                SgaFolderEntry {
+                    name_offset: folder_str[&(ti, full.to_string())],
+                    folder_start_index: folder_start,
+                    folder_end_index: folder_end,
+                    file_start_index: file_start,
+                    file_end_index: file_end,
                 }
+            };
 
-                folder_entries[idx].folder_start_index = folder_start;
-                folder_entries[idx].folder_end_index = folder_end;
-                folder_entries[idx].file_start_index = file_start;
-                folder_entries[idx].file_end_index = file_end;
-
-                for child in children {
-                    queue.push_back(child);
-                }
-            }
+            folder_entries.push(mk(""));
+            emit_child_folders(&toc.root, "", &mut folder_entries, &mk);
 
             let (toc_file_start, toc_file_end) = toc_file_ranges[ti];
             toc_entries.push(SgaToC {
@@ -374,6 +347,57 @@ impl Archive {
             extract_folder(&toc.root, out.as_ref(), &mut written)?;
         }
         Ok(written)
+    }
+
+    /// Returns the decoded bytes of the file at `rel` (a `/`-separated archive
+    /// path, case-insensitive), searching every TOC. Used to read a packed
+    /// `.rgm`/`.layer` back out so it can be patched and re-inserted.
+    pub fn read_file(&self, rel: &str) -> Option<Vec<u8>> {
+        let comps: Vec<String> = rel.split(['/', '\\']).map(|s| s.to_lowercase()).collect();
+        let (name, dirs) = comps.split_last()?;
+        for toc in &self.tocs {
+            let mut folder = &toc.root;
+            let mut ok = true;
+            for d in dirs {
+                match folder.folders.iter().find(|f| &f.name == d) {
+                    Some(f) => folder = f,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                if let Some(f) = folder.files.iter().find(|f| &f.name == name) {
+                    return f.decoded().ok();
+                }
+            }
+        }
+        None
+    }
+
+    /// Inserts (or replaces) a stored, uncompressed file at `rel`. If a file
+    /// already exists at that path in any TOC it is replaced in place; otherwise
+    /// it is added under the first TOC. Fresh entries have no `data_order`, so
+    /// they append after the preserved originals when written.
+    pub fn upsert_stored(&mut self, rel: &str, data: Vec<u8>) {
+        if self.tocs.is_empty() {
+            let _ = get_or_create_toc(&mut self.tocs, "data");
+        }
+        let relp = PathBuf::from(rel.replace('\\', "/"));
+        let comps: Vec<String> =
+            rel.split(['/', '\\']).map(|s| s.to_lowercase()).collect();
+        if let Some((name, dirs)) = comps.split_last() {
+            for toc in &mut self.tocs {
+                if let Some(folder) = descend_existing(&mut toc.root, dirs) {
+                    if let Some(f) = folder.files.iter_mut().find(|f| &f.name == name) {
+                        *f = stored_file(&relp, data);
+                        return;
+                    }
+                }
+            }
+        }
+        insert_or_replace(&mut self.tocs[0].root, &relp, stored_file(&relp, data));
     }
 
     pub fn compile_project<P: AsRef<Path>>(source_dir: P) -> Result<Archive> {
@@ -834,6 +858,17 @@ fn insert_file(root: &mut Folder, rel: &Path, mut file: FileEntry) {
 
 /// Walks/creates the (lower-cased) folder chain for `rel`'s parent, returning
 /// the folder its file belongs in.
+/// Navigates to the existing folder named by `dirs` (lowercased directory
+/// components), or `None` if any component is missing — no folders are created.
+fn descend_existing<'a>(root: &'a mut Folder, dirs: &[String]) -> Option<&'a mut Folder> {
+    let mut folder = root;
+    for d in dirs {
+        let idx = folder.folders.iter().position(|f| &f.name == d)?;
+        folder = &mut folder.folders[idx];
+    }
+    Some(folder)
+}
+
 fn descend<'a>(root: &'a mut Folder, rel: &Path) -> &'a mut Folder {
     let mut folder = root;
     if let Some(parent) = rel.parent() {
@@ -885,14 +920,17 @@ fn dfs_files(
     file_str: &HashMap<(usize, String, String), u32>,
     file_data_off: &HashMap<(usize, String, String), u64>,
     hash_blob: &mut Vec<u8>,
-    hash_offsets: &mut HashMap<Vec<u8>, u32>,
     block_size: usize,
 ) {
     let start = file_entries.len() as u32;
     for file in &folder.files {
         let key = (ti, full.to_string(), file.name.clone());
         let hash_off = if file.verification_type == FileVerificationType::SHA1Blocks {
-            intern_hash(block_sha1(&file.stored_data, block_size), hash_blob, hash_offsets)
+            // The editor appends every file's block-SHA1 without deduplication —
+            // two identical files each get their own (identical) 20-byte entry.
+            let offset = hash_blob.len() as u32;
+            hash_blob.extend_from_slice(&block_sha1(&file.stored_data, block_size));
+            offset
         } else {
             // Non-hashed files (CRC / none) still record the current end of the
             // hash blob rather than 0.
@@ -927,7 +965,6 @@ fn dfs_files(
             file_str,
             file_data_off,
             hash_blob,
-            hash_offsets,
             block_size,
         );
     }
@@ -953,6 +990,30 @@ fn dfs_folder_ranges(
             format!("{full}\\{}", child.name)
         };
         dfs_folder_ranges(ti, child, &child_full, counter, out);
+    }
+}
+
+/// Appends folder-table entries in the archive's canonical order: each folder
+/// writes its direct children as a contiguous block (via `mk`), then recurses
+/// into each child depth-first — matching `dfs_folder_ranges`.
+fn emit_child_folders(
+    folder: &Folder,
+    full: &str,
+    entries: &mut Vec<SgaFolderEntry>,
+    mk: &impl Fn(&str) -> SgaFolderEntry,
+) {
+    let mut child_fulls = Vec::with_capacity(folder.folders.len());
+    for child in &folder.folders {
+        let child_full = if full.is_empty() {
+            child.name.clone()
+        } else {
+            format!("{full}\\{}", child.name)
+        };
+        entries.push(mk(&child_full));
+        child_fulls.push(child_full);
+    }
+    for (child, child_full) in folder.folders.iter().zip(&child_fulls) {
+        emit_child_folders(child, child_full, entries, mk);
     }
 }
 
@@ -1021,16 +1082,6 @@ fn block_sha1(data: &[u8], block_size: usize) -> Vec<u8> {
         out.extend_from_slice(&Sha1::digest(chunk));
     }
     out
-}
-
-fn intern_hash(hash: Vec<u8>, blob: &mut Vec<u8>, map: &mut HashMap<Vec<u8>, u32>) -> u32 {
-    if let Some(&offset) = map.get(&hash) {
-        return offset;
-    }
-    let offset = blob.len() as u32;
-    blob.extend_from_slice(&hash);
-    map.insert(hash, offset);
-    offset
 }
 
 fn name_at(strings: &[u8], offset: usize) -> String {
