@@ -407,6 +407,51 @@ impl Archive {
         insert_or_replace(&mut toc.root, &relp, stored_file(&relp, data));
     }
 
+    /// Re-stores art render-resources to match how the base game packages them:
+    /// `.rrtex` as `Store`, other art as `BufferCompress`, all with `verify =
+    /// None` (the base game hashes nothing here). The a4etk burn used
+    /// `SHA1Blocks`/`CRC`, which the game may refuse for mod art. Returns count.
+    pub fn repackage_art(&mut self) -> Result<usize> {
+        fn kind(name: &str) -> Option<FileStorageType> {
+            if name.ends_with(".rrtex") {
+                Some(FileStorageType::Store)
+            } else if name.ends_with(".rrmaterial")
+                || name.ends_with(".rrgeom")
+                || name.ends_with(".rgm")
+                || name.ends_with(".rgo")
+            {
+                Some(FileStorageType::BufferCompress)
+            } else {
+                None
+            }
+        }
+        fn walk(folder: &mut Folder, n: &mut usize) -> Result<()> {
+            for f in &mut folder.files {
+                if let Some(storage) = kind(&f.name.to_lowercase()) {
+                    let decoded = f.decoded()?;
+                    let stored = encode(&decoded, &storage)?;
+                    let mut crc = Crc::new();
+                    crc.update(&stored);
+                    f.crc = crc.sum();
+                    f.uncompressed_size = decoded.len() as u32;
+                    f.stored_data = stored;
+                    f.storage_type = storage;
+                    f.verification_type = FileVerificationType::None;
+                    *n += 1;
+                }
+            }
+            for child in &mut folder.folders {
+                walk(child, n)?;
+            }
+            Ok(())
+        }
+        let mut n = 0;
+        for toc in &mut self.tocs {
+            walk(&mut toc.root, &mut n)?;
+        }
+        Ok(n)
+    }
+
     /// Removes folders that (recursively) contain no files, across all TOCs.
     /// Editor archives never carry empty folders; leaving them after a delete
     /// can make the game reject the mod's file structure.
