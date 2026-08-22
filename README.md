@@ -41,16 +41,19 @@ sga-archiver pack <mod-source-dir> -o <out.sga>
 The input is a mod source directory. It is expected to contain:
 
 - `<mod>.aoe4mod` — the mod project file (its `<ID>` becomes the archive name)
-- `<mod>.burnproj` (under `assets/`) — the editor project; its `ReflectBurner` and `RRTextureBurner` rules tell the compiler which sources compile into which TOC
+- `<mod>.burnproj` (under `assets/`) — the editor project; its `ReflectBurner`, `RRTextureBurner`, and `UCS` rules tell the compiler which sources compile into which TOC
 - `assets/scar/**/*.scar` — Lua source, compressed into the `data` TOC as-is
-- `assets/**/*.rdo` — reflection source (win conditions, mod info, …), the editable source of truth — **no compiled `.bin` needed**
+- `assets/**/*.rdo` — reflection source (win conditions, mod info, …) — **no compiled `.bin` needed**
 - `assets/**/*.png` — texture source (mod preview image, UI art) — **no compiled `.rrtex` needed**
-- `prebuilt/<toc>/<path>` — pre-burned binary assets that genuinely can't be produced from text source (localization `.ucs`), grouped by TOC alias, e.g. `prebuilt/locale/en/en.ucs`
+- `assets/locdb/<mod>_<locale>.csv` — localization source (`ID`/`Text` columns) — **no compiled `.ucs` needed**
 
-Reflection and texture artifacts are **compiled directly from their sources** — the mod tree carries no `.bin` or `.rrtex`. The compiler reads the `.burnproj` rules to place each output in the right TOC (`mod.rdo` → `info`, `scar/winconditions/*.rdo` → `data`, `mod.png` → `info/mod.rrtex`, …), lower-casing paths the way the editor does.
+Every artifact is **compiled directly from its source** — a mod tree needs no pre-burned binaries at all. The compiler reads the `.burnproj` rules to place each output in the right TOC (`mod.rdo` → `info`, `scar/winconditions/*.rdo` → `data`, `mod.png` → `info/mod.rrtex`, `<mod>_en.csv` → `locale/en/en.ucs`, …), lower-casing paths the way the editor does.
 
 - **Reflection** (`.rdo` → `.bin`): the invariant engine type schema is bundled in the tool (keyed by root object type), so editing a `.rdo` and rebuilding changes win-condition options, labels, and other reflected data. When a `.rdo` is unchanged the output is byte-identical to the editor's.
 - **Textures** (`.png` → `.rrtex`): single-mip BC7 (via `intel_tex_2`) in the Relic Chunky `TSET/TXTR/DXTC/TMAN/TDAT` container, zlib-segmented like the editor. Output is a functionally equivalent BC7 texture (not byte-identical — the editor's BC7/zlib encoders can't be reproduced exactly), verified to decode back to the source image near-losslessly.
+- **Localization** (`.csv` → `.ucs`): UTF-16LE string table (`<id>\t<text>` per line) — byte-identical to the editor's.
+
+Assets the tool can't yet compile (attributes `.rgd`, scenario formats) can still be supplied pre-burned under a `prebuilt/<toc>/<path>` directory and are packed as-is.
 
 SHA1 hashes are generated and the archive is written unencrypted.
 

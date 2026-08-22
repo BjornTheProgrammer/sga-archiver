@@ -408,12 +408,13 @@ impl Archive {
             }
         }
 
-        // Compile reflection `.rdo` and texture `.png` sources per the
-        // burnproj's ReflectBurner / RRTextureBurner rules, so the mod tree
-        // needs no compiled `.bin` or `.rrtex`.
+        // Compile reflection `.rdo`, texture `.png`, and localization CSV
+        // sources per the burnproj's ReflectBurner / RRTextureBurner / UCS
+        // rules, so the mod tree needs no compiled `.bin`, `.rrtex`, or `.ucs`.
         if assets.is_dir() {
             add_reflection_bins(&mut tocs, &assets)?;
             add_texture_bins(&mut tocs, &assets)?;
+            add_localization(&mut tocs, &assets)?;
         }
 
         Ok(Archive {
@@ -503,6 +504,65 @@ fn add_texture_bins(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
         relic_chunky::texture::compile_texture(&png, stem)
             .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
     })
+}
+
+/// Compiles localization CSVs into `.ucs` string tables (the `UCS` burner).
+/// The burnproj rule matches the `.locdb`; each sibling `<stem>_<locale>.csv`
+/// becomes `<locale>/<locale>.ucs` in the rule's TOC.
+fn add_localization(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
+    let Some(burnproj) = find_burnproj(assets) else {
+        return Ok(());
+    };
+    let rules = parse_burn_rules(&std::fs::read_to_string(&burnproj)?, "UCS");
+    if rules.is_empty() {
+        return Ok(());
+    }
+
+    let mut stack = vec![assets.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("locdb")) {
+                continue;
+            }
+            let rel = path.strip_prefix(assets).unwrap_or(&path).to_path_buf();
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let Some(rule) = rules
+                .iter()
+                .find(|r| r.includes.iter().any(|g| glob_match(g, &rel_str)))
+            else {
+                continue;
+            };
+
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let prefix = format!("{stem}_");
+            let locdb_dir = path.parent().unwrap_or(assets).to_path_buf();
+            // Each sibling `<stem>_<locale>.csv` is one locale's string table.
+            for sibling in std::fs::read_dir(&locdb_dir)?.flatten().map(|e| e.path()) {
+                if !sibling.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv")) {
+                    continue;
+                }
+                let file_stem =
+                    sibling.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let Some(locale) = file_stem.strip_prefix(&prefix) else {
+                    continue;
+                };
+                let ucs = crate::localization::compile_ucs(&std::fs::read(&sibling)?)
+                    .map_err(|e| anyhow!("compiling {}: {e:#}", sibling.display()))?;
+                let out_rel = PathBuf::from(locale).join(format!("{locale}.ucs"));
+                let file = stored_file(&out_rel, ucs);
+                let toc = get_or_create_toc(tocs, &rule.alias);
+                insert_or_replace(&mut toc.root, &out_rel, file);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn find_burnproj(assets: &Path) -> Option<PathBuf> {

@@ -4,6 +4,7 @@ use anyhow::Result;
 
 mod archive;
 pub mod entires;
+pub mod localization;
 pub(crate) mod utils;
 
 pub use archive::{Archive, FileEntry, Folder, Toc};
