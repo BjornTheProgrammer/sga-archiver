@@ -376,6 +376,52 @@ impl Archive {
         None
     }
 
+    /// Removes every file whose lowercased name matches `pred`, across all TOCs,
+    /// returning how many were removed. Empty folders are left in place (the
+    /// game tolerates them). Used to strip files the game forbids in a mod pack,
+    /// e.g. streaming `*_packed.rrtex`.
+    pub fn remove_files_where(&mut self, pred: impl Fn(&str) -> bool) -> usize {
+        fn walk(folder: &mut Folder, pred: &impl Fn(&str) -> bool, n: &mut usize) {
+            let before = folder.files.len();
+            folder.files.retain(|f| !pred(&f.name.to_lowercase()));
+            *n += before - folder.files.len();
+            for child in &mut folder.folders {
+                walk(child, pred, n);
+            }
+        }
+        let mut n = 0;
+        for toc in &mut self.tocs {
+            walk(&mut toc.root, &pred, &mut n);
+        }
+        n
+    }
+
+    /// Inserts (or replaces) a stored file at `rel` inside the TOC named
+    /// `toc_alias`, creating that TOC if it doesn't exist. Mods route files by
+    /// purpose into separate TOCs — `info` (mod descriptor), `locale`
+    /// (localization), `data` (everything else) — and the game rejects a file
+    /// that lands in the wrong one.
+    pub fn upsert_stored_in(&mut self, toc_alias: &str, rel: &str, data: Vec<u8>) {
+        let relp = PathBuf::from(rel.replace('\\', "/"));
+        let toc = get_or_create_toc(&mut self.tocs, toc_alias);
+        insert_or_replace(&mut toc.root, &relp, stored_file(&relp, data));
+    }
+
+    /// Removes folders that (recursively) contain no files, across all TOCs.
+    /// Editor archives never carry empty folders; leaving them after a delete
+    /// can make the game reject the mod's file structure.
+    pub fn prune_empty_folders(&mut self) {
+        fn prune(folder: &mut Folder) {
+            for child in &mut folder.folders {
+                prune(child);
+            }
+            folder.folders.retain(|c| !(c.files.is_empty() && c.folders.is_empty()));
+        }
+        for toc in &mut self.tocs {
+            prune(&mut toc.root);
+        }
+    }
+
     /// Inserts (or replaces) a stored, uncompressed file at `rel`. If a file
     /// already exists at that path in any TOC it is replaced in place; otherwise
     /// it is added under the first TOC. Fresh entries have no `data_order`, so
