@@ -1,9 +1,21 @@
 
 use std::io::Cursor;
 
-use relic_chunky::{container::Chunky, decompile::DecompiledReflect};
+use relic_chunky::{container::Chunky, decompile::DecompiledReflect, reflect_write::recompile_bin};
 
 const MOD_BIN: &[u8] = include_bytes!("mod.bin");
+
+/// Read/write drift guard for reflection: decompiling a `.bin` to `.rdo` and
+/// recompiling it must reproduce the original bytes. This is the exact path the
+/// mod tooling uses (mod descriptors), and proves `decompile` and
+/// `reflect_write` are exact inverses for it.
+#[test]
+fn reflection_bin_round_trips_byte_exact() {
+    let chunky = Chunky::read(&mut Cursor::new(MOD_BIN)).unwrap();
+    let decompiled = DecompiledReflect::parse(&chunky).unwrap();
+    let rebuilt = recompile_bin(&decompiled.to_rdo_xml(), MOD_BIN).unwrap();
+    assert_eq!(rebuilt, MOD_BIN, "decompile→recompile was not byte-exact");
+}
 
 fn decompile(bytes: &'static [u8]) -> DecompiledReflect {
     let chunky = Chunky::read(&mut Cursor::new(bytes)).unwrap();
