@@ -17,7 +17,8 @@ use anyhow::{anyhow, bail, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use crate::rgd_write::{write_rgd, Node, Value};
+use crate::rgd::{RGDNode, RGDValue};
+use crate::rgd_write::write_rgd;
 
 /// Compiles an attribute `.xml` (root `<mod>` or `<instance>`) into `.rgd` bytes.
 pub fn compile_attrib(xml: &str) -> Result<Vec<u8>> {
@@ -31,59 +32,59 @@ pub fn compile_attrib(xml: &str) -> Result<Vec<u8>> {
 }
 
 /// Root `<mod guid=… override_instances=…>` → `{override_instances, id}`.
-fn mod_nodes(root: &Elem) -> Vec<Node> {
+fn mod_nodes(root: &Elem) -> Vec<RGDNode> {
     vec![
-        Node::new("override_instances", Value::Bool(parse_bool(root.attr("override_instances")))),
-        Node::new("id", Value::CString(root.attr("guid").to_string())),
+        RGDNode::new("override_instances", RGDValue::Boolean(parse_bool(root.attr("override_instances")))),
+        RGDNode::new("id", RGDValue::CString(root.attr("guid").to_string())),
     ]
 }
 
 /// `<instance>` → `{default: {<groups…>, pbgid}, instance_version: 2}`.
-fn instance_nodes(root: &Elem) -> Vec<Node> {
+fn instance_nodes(root: &Elem) -> Vec<RGDNode> {
     let default_children = root.children.iter().filter_map(transform).collect();
     vec![
-        Node::new("default", Value::List(default_children)),
-        Node::new("instance_version", Value::Int(2)),
+        RGDNode::new("default", RGDValue::List(default_children)),
+        RGDNode::new("instance_version", RGDValue::Int(2)),
     ]
 }
 
 /// Transforms one source element into a game-data node.
-fn transform(elem: &Elem) -> Option<Node> {
+fn transform(elem: &Elem) -> Option<RGDNode> {
     let key = elem.attr("name").to_string();
     let value = elem.attr("value");
-    let node = |v: Value| Node::new(key.clone(), v);
+    let node = |v: RGDValue| RGDNode::new(key.clone(), v);
     Some(match elem.tag.as_str() {
-        "group" | "enum_table" => node(Value::List(children(elem))),
-        "list" => node(Value::List2(children(elem))),
+        "group" | "enum_table" => node(RGDValue::List(children(elem))),
+        "list" => node(RGDValue::List2(children(elem))),
         "template_reference" => {
-            let mut items = vec![Node::new("$REF", Value::CString(value.to_string()))];
+            let mut items = vec![RGDNode::new("$REF", RGDValue::CString(value.to_string()))];
             items.extend(children(elem));
-            node(Value::List(items))
+            node(RGDValue::List(items))
         }
         "instance_reference" => {
             let (map, name) = value.rsplit_once('\\').unwrap_or(("", value));
-            node(Value::List2(vec![
-                Node::new("$PBGNAME", Value::CString(name.to_string())),
-                Node::new("$PBGMAP", Value::CString(map.to_string())),
+            node(RGDValue::List2(vec![
+                RGDNode::new("$PBGNAME", RGDValue::CString(name.to_string())),
+                RGDNode::new("$PBGMAP", RGDValue::CString(map.to_string())),
             ]))
         }
-        "float" => node(Value::Float(value.parse().unwrap_or(0.0))),
-        "int" => node(Value::Int(value.parse().unwrap_or(0))),
-        "bool" => node(Value::Bool(parse_bool(value))),
-        "file" => node(Value::CString(value.to_string())),
-        "uniqueid" => node(Value::Int(value.parse().unwrap_or(0))),
+        "float" => node(RGDValue::Float(value.parse().unwrap_or(0.0))),
+        "int" => node(RGDValue::Int(value.parse().unwrap_or(0))),
+        "bool" => node(RGDValue::Boolean(parse_bool(value))),
+        "file" => node(RGDValue::CString(value.to_string())),
+        "uniqueid" => node(RGDValue::Int(value.parse().unwrap_or(0))),
         "locstring" => {
             if let Some(guid) = elem.attrs.get("mod") {
-                node(Value::LocString(format!("${guid}:{value}")))
+                node(RGDValue::LocString(format!("${guid}:{value}")))
             } else {
-                node(Value::Int(value.parse().unwrap_or(0)))
+                node(RGDValue::Int(value.parse().unwrap_or(0)))
             }
         }
         _ => return None,
     })
 }
 
-fn children(elem: &Elem) -> Vec<Node> {
+fn children(elem: &Elem) -> Vec<RGDNode> {
     elem.children.iter().filter_map(transform).collect()
 }
 

@@ -55,6 +55,18 @@ pub enum RGDDataType {
 }
 
 impl RGDDataType {
+    /// Every variant, so `from_code` can map a wire code back to its variant
+    /// without repeating the numeric values (they live only on the enum).
+    const ALL: [RGDDataType; 7] = [
+        RGDDataType::Float,
+        RGDDataType::Int,
+        RGDDataType::Boolean,
+        RGDDataType::CString,
+        RGDDataType::LocString,
+        RGDDataType::List,
+        RGDDataType::List2,
+    ];
+
     pub fn name(&self) -> &'static str {
         match self {
             RGDDataType::Float => "Float",
@@ -65,52 +77,60 @@ impl RGDDataType {
             RGDDataType::List | RGDDataType::List2 => "List",
         }
     }
+
+    /// The on-disk type code — the enum discriminant. This is the single source
+    /// of truth for the numeric codes; read and write both go through it.
+    pub fn code(self) -> i32 {
+        self as i32
+    }
+
+    /// Maps an on-disk type code to its variant (or `None` if unknown).
+    pub fn from_code(code: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|ty| ty.code() == code)
+    }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// A game-data value, shared by the reader and the writer. `List` is the
+/// engine's keyed table (type 100); `List2` is its ordered/reference list
+/// (type 101).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum RGDValue {
     Float(f32),
     Int(i32),
     Boolean(bool),
     CString(String),
     LocString(String),
-    List(Vec<RGDEntry>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RGDEntry {
-    pub key_hash: u64,
-    pub value: RGDValue,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum RGDNodeValue {
-    Float(f32),
-    Int(i32),
-    Boolean(bool),
-    CString(String),
-    LocString(String),
     List(Vec<RGDNode>),
+    List2(Vec<RGDNode>),
 }
 
-impl RGDNodeValue {
+impl RGDValue {
     pub fn data_type(&self) -> RGDDataType {
         match self {
-            RGDNodeValue::Float(_) => RGDDataType::Float,
-            RGDNodeValue::Int(_) => RGDDataType::Int,
-            RGDNodeValue::Boolean(_) => RGDDataType::Boolean,
-            RGDNodeValue::CString(_) => RGDDataType::CString,
-            RGDNodeValue::LocString(_) => RGDDataType::LocString,
-            RGDNodeValue::List(_) => RGDDataType::List,
+            RGDValue::Float(_) => RGDDataType::Float,
+            RGDValue::Int(_) => RGDDataType::Int,
+            RGDValue::Boolean(_) => RGDDataType::Boolean,
+            RGDValue::CString(_) => RGDDataType::CString,
+            RGDValue::LocString(_) => RGDDataType::LocString,
+            RGDValue::List(_) => RGDDataType::List,
+            RGDValue::List2(_) => RGDDataType::List2,
         }
     }
 }
 
+/// One keyed game-data node. The reader resolves `key` from the `KEYS`
+/// dictionary; the writer hashes it back.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RGDNode {
     pub key: String,
-    pub value: RGDNodeValue,
+    pub value: RGDValue,
+}
+
+impl RGDNode {
+    pub fn new(key: impl Into<String>, value: RGDValue) -> Self {
+        RGDNode { key: key.into(), value }
+    }
 }
 
 impl RelicGameData {
@@ -140,14 +160,13 @@ impl RelicGameData {
         let aegd_data = aegd_data.ok_or(RelicGameDataError::MissingDataAegdChunk)?;
 
         let keys = Self::parse_keys(keys_data)?;
-        let entries = Self::parse_aegd(aegd_data)?;
-
-        Ok(Self::resolve_nodes(&entries, &keys))
+        Self::parse_aegd(aegd_data, &keys)
     }
 
     fn read_chunky_list<R: Read + Seek>(
         reader: &mut R,
-    ) -> Result<Vec<RGDEntry>, RelicGameDataError> {
+        keys: &HashMap<u64, String>,
+    ) -> Result<Vec<RGDNode>, RelicGameDataError> {
         let length = reader.read_u32::<LittleEndian>()? as usize;
 
         let mut index_entries = Vec::with_capacity(length.min(1024));
@@ -160,46 +179,48 @@ impl RelicGameData {
 
         let data_start = reader.stream_position()?;
 
-        let mut entries = Vec::with_capacity(index_entries.len());
+        let mut nodes = Vec::with_capacity(index_entries.len());
         for (key, data_type, offset) in index_entries {
             let position = data_start
                 .checked_add_signed(offset as i64)
                 .ok_or(RelicGameDataError::InvalidDataOffset { key, offset })?;
             reader.seek(SeekFrom::Start(position))?;
 
-            entries.push(RGDEntry {
-                key_hash: key,
-                value: Self::read_value(reader, data_type)?,
+            nodes.push(RGDNode {
+                key: Self::resolve_key(key, keys),
+                value: Self::read_value(reader, data_type, keys)?,
             });
         }
 
-        Ok(entries)
+        Ok(nodes)
     }
 
     fn read_value<R: Read + Seek>(
         reader: &mut R,
         data_type: i32,
+        keys: &HashMap<u64, String>,
     ) -> Result<RGDValue, RelicGameDataError> {
-        Ok(match data_type {
-            0 => RGDValue::Float(reader.read_f32::<LittleEndian>()?),
-            1 => RGDValue::Int(reader.read_i32::<LittleEndian>()?),
-            2 => RGDValue::Boolean(reader.read_u8()? != 0),
-            3 => RGDValue::CString(Self::read_cstring(reader)?),
-            4 => RGDValue::LocString(Self::read_wstring(reader)?),
-            100 | 101 => RGDValue::List(Self::read_chunky_list(reader)?),
-            other => {
-                if std::env::var_os("RGD_DEBUG_UNKNOWN_TYPE").is_some() {
-                    let position = reader.stream_position()?;
-                    let mut peek = [0u8; 256];
-                    let read = reader.read(&mut peek)?;
-                    reader.seek(SeekFrom::Start(position))?;
-                    eprintln!(
-                        "unknown data type {other} at offset {position}, next {read} bytes: {:02x?}",
-                        &peek[..read]
-                    );
-                }
-                return Err(RelicGameDataError::UnknownDataType(other));
+        let Some(ty) = RGDDataType::from_code(data_type) else {
+            if std::env::var_os("RGD_DEBUG_UNKNOWN_TYPE").is_some() {
+                let position = reader.stream_position()?;
+                let mut peek = [0u8; 256];
+                let read = reader.read(&mut peek)?;
+                reader.seek(SeekFrom::Start(position))?;
+                eprintln!(
+                    "unknown data type {data_type} at offset {position}, next {read} bytes: {:02x?}",
+                    &peek[..read]
+                );
             }
+            return Err(RelicGameDataError::UnknownDataType(data_type));
+        };
+        Ok(match ty {
+            RGDDataType::Float => RGDValue::Float(reader.read_f32::<LittleEndian>()?),
+            RGDDataType::Int => RGDValue::Int(reader.read_i32::<LittleEndian>()?),
+            RGDDataType::Boolean => RGDValue::Boolean(reader.read_u8()? != 0),
+            RGDDataType::CString => RGDValue::CString(Self::read_cstring(reader)?),
+            RGDDataType::LocString => RGDValue::LocString(Self::read_wstring(reader)?),
+            RGDDataType::List => RGDValue::List(Self::read_chunky_list(reader, keys)?),
+            RGDDataType::List2 => RGDValue::List2(Self::read_chunky_list(reader, keys)?),
         })
     }
 
@@ -229,10 +250,13 @@ impl RelicGameData {
         Ok(String::from_utf16_lossy(&units))
     }
 
-    fn parse_aegd(data: &[u8]) -> Result<Vec<RGDEntry>, RelicGameDataError> {
+    fn parse_aegd(
+        data: &[u8],
+        keys: &HashMap<u64, String>,
+    ) -> Result<Vec<RGDNode>, RelicGameDataError> {
         let mut reader = Cursor::new(data);
         let _unknown = reader.read_u32::<LittleEndian>()?;
-        Self::read_chunky_list(&mut reader)
+        Self::read_chunky_list(&mut reader, keys)
     }
 
     pub fn parse_keys(data: &[u8]) -> Result<HashMap<u64, String>, RelicGameDataError> {
@@ -242,25 +266,6 @@ impl RelicGameData {
             key_string_map.entry(entry.hash).or_insert(entry.value);
         }
         Ok(key_string_map)
-    }
-
-    pub fn resolve_nodes(entries: &[RGDEntry], keys: &HashMap<u64, String>) -> Vec<RGDNode> {
-        entries
-            .iter()
-            .map(|entry| RGDNode {
-                key: Self::resolve_key(entry.key_hash, keys),
-                value: match &entry.value {
-                    RGDValue::Float(value) => RGDNodeValue::Float(*value),
-                    RGDValue::Int(value) => RGDNodeValue::Int(*value),
-                    RGDValue::Boolean(value) => RGDNodeValue::Boolean(*value),
-                    RGDValue::CString(value) => RGDNodeValue::CString(value.clone()),
-                    RGDValue::LocString(value) => RGDNodeValue::LocString(value.clone()),
-                    RGDValue::List(children) => {
-                        RGDNodeValue::List(Self::resolve_nodes(children, keys))
-                    }
-                },
-            })
-            .collect()
     }
 
     fn resolve_key(key: u64, keys: &HashMap<u64, String>) -> String {
@@ -286,7 +291,7 @@ pub fn game_data_to_xml(nodes: &[RGDNode]) -> Result<String, quick_xml::Error> {
         element.push_attribute(("Type", node.value.data_type().name()));
 
         match &node.value {
-            RGDNodeValue::List(children) => {
+            RGDValue::List(children) | RGDValue::List2(children) => {
                 writer.write_event(Event::Start(element))?;
                 for child in children {
                     write_node(writer, child)?;
@@ -295,12 +300,12 @@ pub fn game_data_to_xml(nodes: &[RGDNode]) -> Result<String, quick_xml::Error> {
             }
             value => {
                 let text = match value {
-                    RGDNodeValue::Float(value) => value.to_string(),
-                    RGDNodeValue::Int(value) => value.to_string(),
-                    RGDNodeValue::Boolean(value) => value.to_string(),
-                    RGDNodeValue::CString(value) => value.clone(),
-                    RGDNodeValue::LocString(value) => value.clone(),
-                    RGDNodeValue::List(_) => unreachable!("handled above"),
+                    RGDValue::Float(value) => value.to_string(),
+                    RGDValue::Int(value) => value.to_string(),
+                    RGDValue::Boolean(value) => value.to_string(),
+                    RGDValue::CString(value) => value.clone(),
+                    RGDValue::LocString(value) => value.clone(),
+                    RGDValue::List(_) | RGDValue::List2(_) => unreachable!("handled above"),
                 };
                 element.push_attribute(("Value", text.as_str()));
                 writer.write_event(Event::Empty(element))?;

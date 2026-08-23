@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use relic_chunky::{
     container::Chunky,
-    rgd::{RGDNode, RGDNodeValue, RelicGameData, game_data_to_json, game_data_to_xml},
+    rgd::{RGDNode, RGDValue, RelicGameData, game_data_to_json, game_data_to_xml},
 };
 
 const FIXTURE: &[u8] = include_bytes!("weapon_war_elephant_spear_3_sul.rgd");
@@ -21,7 +21,7 @@ fn child<'a>(nodes: &'a [RGDNode], key: &str) -> &'a RGDNode {
 
 fn list<'a>(nodes: &'a [RGDNode], key: &str) -> &'a [RGDNode] {
     match &child(nodes, key).value {
-        RGDNodeValue::List(children) => children,
+        RGDValue::List(children) => children,
         other => panic!("expected '{key}' to be a list, got {other:?}"),
     }
 }
@@ -35,7 +35,7 @@ fn parses_top_level_nodes() {
 
     assert_eq!(
         child(&nodes, "instance_version").value,
-        RGDNodeValue::Int(2)
+        RGDValue::Int(2)
     );
 }
 
@@ -46,15 +46,15 @@ fn resolves_scalar_values() {
 
     assert_eq!(
         child(weapon_bag, "name").value,
-        RGDNodeValue::CString("Spearman Weapon".to_string())
+        RGDValue::CString("Spearman Weapon".to_string())
     );
     assert_eq!(
         child(weapon_bag, "weapon_class").value,
-        RGDNodeValue::CString("cdn_2h_spear".to_string())
+        RGDValue::CString("cdn_2h_spear".to_string())
     );
     assert_eq!(
         child(list(&nodes, "default"), "pbgid").value,
-        RGDNodeValue::Int(144673)
+        RGDValue::Int(144673)
     );
 }
 
@@ -75,7 +75,7 @@ fn nested_siblings_keep_their_own_keys() {
     assert!(
         fog_of_war
             .iter()
-            .all(|node| node.value == RGDNodeValue::Boolean(true))
+            .all(|node| node.value == RGDValue::Boolean(true))
     );
 }
 
@@ -86,7 +86,7 @@ fn json_round_trips_special_characters() {
     let awkward = "quote\" backslash\\ path\\races\\melee tab\t control\u{1}";
     let nodes = vec![RGDNode {
         key: awkward.to_string(),
-        value: RGDNodeValue::CString(awkward.to_string()),
+        value: RGDValue::CString(awkward.to_string()),
     }];
 
     let json = game_data_to_json(&nodes).unwrap();
@@ -101,21 +101,21 @@ fn json_encodes_values_as_native_types() {
     let nodes = vec![
         RGDNode {
             key: "a_float".to_string(),
-            value: RGDNodeValue::Float(1.5),
+            value: RGDValue::Float(1.5),
         },
         RGDNode {
             key: "an_int".to_string(),
-            value: RGDNodeValue::Int(7),
+            value: RGDValue::Int(7),
         },
         RGDNode {
             key: "a_bool".to_string(),
-            value: RGDNodeValue::Boolean(true),
+            value: RGDValue::Boolean(true),
         },
         RGDNode {
             key: "a_list".to_string(),
-            value: RGDNodeValue::List(vec![RGDNode {
+            value: RGDValue::List(vec![RGDNode {
                 key: "nested".to_string(),
-                value: RGDNodeValue::CString("x".to_string()),
+                value: RGDValue::CString("x".to_string()),
             }]),
         },
     ];
@@ -135,7 +135,7 @@ fn json_encodes_values_as_native_types() {
 fn xml_escapes_special_characters() {
     let nodes = vec![RGDNode {
         key: "a&b<c>".to_string(),
-        value: RGDNodeValue::CString("quote\"".to_string()),
+        value: RGDValue::CString("quote\"".to_string()),
     }];
 
     let xml = game_data_to_xml(&nodes).unwrap();
@@ -192,4 +192,25 @@ fn keys_table_round_trips_byte_exact() {
     table.write_le(&mut out).unwrap();
 
     assert_eq!(out.into_inner(), keys, "KeyTable round-trip was not byte-exact");
+}
+
+/// Whole-format read/write drift guard over the shared `RGDNode`/`RGDValue`
+/// model. The writer canonicalises layout (values sorted by key hash), so it
+/// won't reproduce the game's exact bytes — but read and write must be exact
+/// inverses of *each other*: writing the model, reading it back, and writing it
+/// again must yield identical bytes. Any disagreement on type codes, value
+/// encoding, list kind (List vs List2), alignment, KEYS or CRC breaks this.
+#[test]
+fn rgd_write_read_round_trip_is_stable() {
+    let read = |bytes: &[u8]| {
+        let chunky = Chunky::read(&mut Cursor::new(bytes)).unwrap();
+        RelicGameData::parse(&chunky).unwrap()
+    };
+
+    let nodes = read(FIXTURE);
+    let once = relic_chunky::rgd_write::write_rgd(&nodes).unwrap();
+    let reparsed = read(&once);
+    let twice = relic_chunky::rgd_write::write_rgd(&reparsed).unwrap();
+
+    assert_eq!(once, twice, "write→read→write drifted — read and write disagree");
 }
