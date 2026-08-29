@@ -78,6 +78,33 @@ impl<'a> Emit<'a> {
     }
 }
 
+fn prop(out: &mut String, depth: usize, name: &str, ty: &str, value: &str) {
+    let tab = "\t".repeat(depth);
+    out.push_str(&format!(
+        "{tab}<DataProperty Name=\"{}\" Type=\"{}\" Value=\"{}\"/>\r\n",
+        xml_escape(name),
+        xml_escape(ty),
+        xml_escape(value)
+    ));
+}
+
+fn bytes_prop(out: &mut String, depth: usize, name: &str, count: usize, bytes: &[u8]) {
+    let tab = "\t".repeat(depth);
+    out.push_str(&format!(
+        "{tab}<DataProperty Name=\"{}\" Type=\"Bytes\" Count=\"{count}\" Value=\"{}\"/>\r\n",
+        xml_escape(name),
+        hex_encode(bytes)
+    ));
+}
+
+fn empty_prop(out: &mut String, depth: usize, name: &str) {
+    let tab = "\t".repeat(depth);
+    out.push_str(&format!(
+        "{tab}<DataProperty Name=\"{}\" Type=\"Object\"/>\r\n",
+        xml_escape(name)
+    ));
+}
+
 impl DecompiledReflect {
     pub fn parse(chunky: &Chunky) -> Option<DecompiledReflect> {
         let mut out = DecompiledReflect::default();
@@ -191,11 +218,7 @@ impl DecompiledReflect {
 
         if !ty.bases.is_empty() {
             if let Some(value) = self.base_types_string(ty) {
-                let ptab = "\t".repeat(depth + 1);
-                out.push_str(&format!(
-                    "{ptab}<DataProperty Name=\"#BaseTypes\" Type=\"String\" Value=\"{}\"/>\r\n",
-                    xml_escape(&value)
-                ));
+                prop(out, depth + 1, "#BaseTypes", "String", &value);
             }
         }
 
@@ -212,29 +235,20 @@ impl DecompiledReflect {
         emit: &mut Emit,
         out: &mut String,
     ) {
-        let tab = "\t".repeat(depth);
         let base = self.base_of(obj);
 
         if is_enum_type(&ty.name) {
             let hash = u64_at(&self.data, base).unwrap_or(0);
             match self.interned.get(&hash) {
-                Some(value) => out.push_str(&format!(
-                    "{tab}<DataProperty Name=\"m_enumName\" Type=\"String\" Value=\"{}\"/>\r\n",
-                    xml_escape(value)
-                )),
-                None => out.push_str(&format!(
-                    "{tab}<DataProperty Name=\"m_hashValue\" Type=\"UInt64\" Value=\"{hash}\"/>\r\n",
-                )),
+                Some(value) => prop(out, depth, "m_enumName", "String", value),
+                None => prop(out, depth, "m_hashValue", "UInt64", &hash.to_string()),
             }
             return;
         }
 
         match classify_field(&ty.name, |n| self.has_fields(n)) {
             FieldKind::Str => {
-                out.push_str(&format!(
-                    "{tab}<DataProperty Name=\"m_value\" Type=\"String\" Value=\"{}\"/>\r\n",
-                    xml_escape(&self.read_string(base))
-                ));
+                prop(out, depth, "m_value", "String", &self.read_string(base));
             }
             FieldKind::Array => {
                 let rel = i32_at(&self.data, base).unwrap_or(0);
@@ -246,10 +260,7 @@ impl DecompiledReflect {
                     Some(_) => {}
                     None => {
                         if let Some(bytes) = self.raw_array_bytes(&ty.name, base, rel, count) {
-                            out.push_str(&format!(
-                                "{tab}<DataProperty Name=\"m_elements\" Type=\"Bytes\" Count=\"{count}\" Value=\"{}\"/>\r\n",
-                                hex_encode(&bytes)
-                            ));
+                            bytes_prop(out, depth, "m_elements", count, &bytes);
                         }
                     }
                 }
@@ -266,10 +277,7 @@ impl DecompiledReflect {
             FieldKind::Opaque if ty.fields.is_empty() && ty.size > 0 => {
                 let size = ty.size as usize;
                 let bytes = self.data.get(base..base + size).unwrap_or_default();
-                out.push_str(&format!(
-                    "{tab}<DataProperty Name=\"#Raw\" Type=\"Bytes\" Count=\"{size}\" Value=\"{}\"/>\r\n",
-                    hex_encode(bytes)
-                ));
+                bytes_prop(out, depth, "#Raw", size, bytes);
             }
             _ => {
                 for field in &ty.fields {
@@ -287,16 +295,9 @@ impl DecompiledReflect {
         emit: &mut Emit,
         out: &mut String,
     ) {
-        let tab = "\t".repeat(depth);
         let pos = self.base_of(parent) + field.offset as usize;
         let file_pos = parent.data_offset + field.offset as usize;
         let t = field.type_name.as_str();
-        let empty = |out: &mut String| {
-            out.push_str(&format!(
-                "{tab}<DataProperty Name=\"{}\" Type=\"Object\"/>\r\n",
-                field.name
-            ));
-        };
 
         match classify_field(t, |n| self.has_fields(n)) {
             FieldKind::Scalar => {
@@ -307,10 +308,7 @@ impl DecompiledReflect {
                 } else {
                     ("Int32", i32_at(&self.data, pos).unwrap_or(0).to_string())
                 };
-                out.push_str(&format!(
-                    "{tab}<DataProperty Name=\"{}\" Type=\"{xml_type}\" Value=\"{value}\"/>\r\n",
-                    field.name
-                ));
+                prop(out, depth, &field.name, xml_type, &value);
             }
             FieldKind::Scalar64 => {
                 let raw = u64_at(&self.data, pos).unwrap_or(0);
@@ -319,40 +317,27 @@ impl DecompiledReflect {
                 } else {
                     ("Int64", (raw as i64).to_string())
                 };
-                out.push_str(&format!(
-                    "{tab}<DataProperty Name=\"{}\" Type=\"{xml_type}\" Value=\"{value}\"/>\r\n",
-                    field.name
-                ));
+                prop(out, depth, &field.name, xml_type, &value);
             }
             FieldKind::Scalar8 => {
                 let value = self.data.get(pos).copied().unwrap_or(0);
-                out.push_str(&format!(
-                    "{tab}<DataProperty Name=\"{}\" Type=\"UInt8\" Value=\"{value}\"/>\r\n",
-                    field.name
-                ));
+                prop(out, depth, &field.name, "UInt8", &value.to_string());
             }
             FieldKind::Bool => {
                 let value = self.data.get(pos).copied().unwrap_or(0) != 0;
-                out.push_str(&format!(
-                    "{tab}<DataProperty Name=\"{}\" Type=\"Bool\" Value=\"{value}\"/>\r\n",
-                    field.name
-                ));
+                prop(out, depth, &field.name, "Bool", &value.to_string());
             }
             FieldKind::Str => {
                 match emit.child_at(file_pos, parent.id) {
                     Some(child) => {
                         self.emit_object_property(&field.name, &[child], depth, emit, out)
                     }
-                    None => out.push_str(&format!(
-                        "{tab}<DataProperty Name=\"{}\" Type=\"String\" Value=\"{}\"/>\r\n",
-                        field.name,
-                        xml_escape(&self.read_string(pos))
-                    )),
+                    None => prop(out, depth, &field.name, "String", &self.read_string(pos)),
                 }
             }
             FieldKind::Embed | FieldKind::Enum => match emit.child_at(file_pos, parent.id) {
                 Some(child) => self.emit_object_property(&field.name, &[child], depth, emit, out),
-                None => empty(out),
+                None => empty_prop(out, depth, &field.name),
             },
             FieldKind::OffsetPointer => {
                 let rel = i32_at(&self.data, pos).unwrap_or(0);
@@ -361,7 +346,7 @@ impl DecompiledReflect {
                     Some(child) => {
                         self.emit_object_property(&field.name, &[child], depth, emit, out)
                     }
-                    None => empty(out),
+                    None => empty_prop(out, depth, &field.name),
                 }
             }
             FieldKind::Array | FieldKind::PointerArray => {
@@ -376,7 +361,7 @@ impl DecompiledReflect {
                         Some(children) if !children.is_empty() => {
                             self.emit_object_property(&field.name, &children, depth, emit, out)
                         }
-                        _ => empty(out),
+                        _ => empty_prop(out, depth, &field.name),
                     }
                     return;
                 }
@@ -384,20 +369,16 @@ impl DecompiledReflect {
                     Some(children) if !children.is_empty() => {
                         self.emit_object_property(&field.name, &children, depth, emit, out)
                     }
-                    Some(_) => empty(out),
+                    Some(_) => empty_prop(out, depth, &field.name),
                     None => match self.raw_array_bytes(t, pos, rel, count) {
-                        Some(bytes) => out.push_str(&format!(
-                            "{tab}<DataProperty Name=\"{}\" Type=\"Bytes\" Count=\"{count}\" Value=\"{}\"/>\r\n",
-                            field.name,
-                            hex_encode(&bytes)
-                        )),
-                        None => empty(out),
+                        Some(bytes) => bytes_prop(out, depth, &field.name, count, &bytes),
+                        None => empty_prop(out, depth, &field.name),
                     },
                 }
             }
             FieldKind::Opaque => match emit.child_at(file_pos, parent.id) {
                 Some(child) => self.emit_object_property(&field.name, &[child], depth, emit, out),
-                None => empty(out),
+                None => empty_prop(out, depth, &field.name),
             },
         }
     }
@@ -468,7 +449,8 @@ impl DecompiledReflect {
         let tab = "\t".repeat(depth);
         let ctab = "\t".repeat(depth + 1);
         out.push_str(&format!(
-            "{tab}<DataProperty Name=\"{field_name}\" Type=\"Object\">\r\n"
+            "{tab}<DataProperty Name=\"{}\" Type=\"Object\">\r\n",
+            xml_escape(field_name)
         ));
         for child in children {
             let type_name = self
