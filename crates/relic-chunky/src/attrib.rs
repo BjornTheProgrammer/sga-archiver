@@ -25,7 +25,7 @@ pub fn compile_attrib(xml: &str) -> Result<Vec<u8>> {
     let root = parse_tree(xml)?;
     let nodes = match root.tag.as_str() {
         "mod" => mod_nodes(&root),
-        "instance" => instance_nodes(&root),
+        "instance" => instance_nodes(&root)?,
         other => bail!("unexpected attribute root element <{other}>"),
     };
     write_rgd(&nodes)
@@ -40,25 +40,26 @@ fn mod_nodes(root: &Elem) -> Vec<RGDNode> {
 }
 
 /// `<instance>` → `{default: {<groups…>, pbgid}, instance_version: 2}`.
-fn instance_nodes(root: &Elem) -> Vec<RGDNode> {
-    let default_children = root.children.iter().filter_map(transform).collect();
-    vec![
-        RGDNode::new("default", RGDValue::List(default_children)),
+fn instance_nodes(root: &Elem) -> Result<Vec<RGDNode>> {
+    Ok(vec![
+        RGDNode::new("default", RGDValue::List(children(root)?)),
         RGDNode::new("instance_version", RGDValue::Int(2)),
-    ]
+    ])
 }
 
-/// Transforms one source element into a game-data node.
-fn transform(elem: &Elem) -> Option<RGDNode> {
+fn transform(elem: &Elem) -> Result<RGDNode> {
     let key = elem.attr("name").to_string();
     let value = elem.attr("value");
     let node = |v: RGDValue| RGDNode::new(key.clone(), v);
-    Some(match elem.tag.as_str() {
-        "group" | "enum_table" => node(RGDValue::List(children(elem))),
-        "list" => node(RGDValue::List2(children(elem))),
+    let scalar = |what: &str| {
+        anyhow!("attribute element <{} name=\"{key}\">: invalid {what} value {value:?}", elem.tag)
+    };
+    Ok(match elem.tag.as_str() {
+        "group" | "enum_table" => node(RGDValue::List(children(elem)?)),
+        "list" => node(RGDValue::List2(children(elem)?)),
         "template_reference" => {
             let mut items = vec![RGDNode::new("$REF", RGDValue::CString(value.to_string()))];
-            items.extend(children(elem));
+            items.extend(children(elem)?);
             node(RGDValue::List(items))
         }
         "instance_reference" => {
@@ -68,24 +69,24 @@ fn transform(elem: &Elem) -> Option<RGDNode> {
                 RGDNode::new("$PBGMAP", RGDValue::CString(map.to_string())),
             ]))
         }
-        "float" => node(RGDValue::Float(value.parse().unwrap_or(0.0))),
-        "int" => node(RGDValue::Int(value.parse().unwrap_or(0))),
+        "float" => node(RGDValue::Float(value.parse().map_err(|_| scalar("float"))?)),
+        "int" => node(RGDValue::Int(value.parse().map_err(|_| scalar("int"))?)),
         "bool" => node(RGDValue::Boolean(parse_bool(value))),
         "file" => node(RGDValue::CString(value.to_string())),
-        "uniqueid" => node(RGDValue::Int(value.parse().unwrap_or(0))),
+        "uniqueid" => node(RGDValue::Int(value.parse().map_err(|_| scalar("int"))?)),
         "locstring" => {
             if let Some(guid) = elem.attrs.get("mod") {
                 node(RGDValue::LocString(format!("${guid}:{value}")))
             } else {
-                node(RGDValue::Int(value.parse().unwrap_or(0)))
+                node(RGDValue::Int(value.parse().map_err(|_| scalar("locstring id"))?))
             }
         }
-        _ => return None,
+        other => bail!("unrecognized attribute element <{other}> (name {key:?})"),
     })
 }
 
-fn children(elem: &Elem) -> Vec<RGDNode> {
-    elem.children.iter().filter_map(transform).collect()
+fn children(elem: &Elem) -> Result<Vec<RGDNode>> {
+    elem.children.iter().map(transform).collect()
 }
 
 fn parse_bool(s: &str) -> bool {
@@ -113,10 +114,10 @@ fn attrs_of(tag: &quick_xml::events::BytesStart) -> HashMap<String, String> {
         .flatten()
         .map(|a| {
             let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
-            let val = a
-                .unescape_value()
+            let raw = String::from_utf8_lossy(&a.value).into_owned();
+            let val = quick_xml::escape::unescape(&raw)
                 .map(|v| v.into_owned())
-                .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
+                .unwrap_or(raw);
             (key, val)
         })
         .collect()

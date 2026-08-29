@@ -585,12 +585,10 @@ impl Archive {
             }
         }
 
-        // Compile reflection `.rdo`, texture `.png`, and localization CSV
-        // sources per the burnproj's ReflectBurner / RRTextureBurner / UCS
-        // rules, so the mod tree needs no compiled `.bin`, `.rrtex`, or `.ucs`.
         if assets.is_dir() {
             add_reflection_bins(&mut tocs, &assets)?;
             add_texture_bins(&mut tocs, &assets)?;
+            add_attribute_rgds(&mut tocs, &assets)?;
             add_localization(&mut tocs, &assets)?;
         }
 
@@ -672,6 +670,14 @@ fn add_reflection_bins(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
     add_burned_files(tocs, assets, "ReflectBurner", "rdo", "bin", |path, _stem| {
         let rdo_xml = std::fs::read_to_string(path)?;
         relic_chunky::reflect_write::compile_bin(&rdo_xml)
+            .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
+    })
+}
+
+fn add_attribute_rgds(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
+    add_burned_files(tocs, assets, "Mod Attributes", "xml", "rgd", |path, _stem| {
+        let xml = std::fs::read_to_string(path)?;
+        relic_chunky::attrib::compile_attrib(&xml)
             .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
     })
 }
