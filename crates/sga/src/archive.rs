@@ -11,6 +11,7 @@ use flate2::{Compression, Crc};
 use sha1::{Digest, Sha1};
 
 use crate::entires::{
+    HeaderReserved,
     FileEncryptionType, FileStorageType, FileVerificationType, SgaFileEntry, SgaFolderEntry,
     SgaHeader, SgaToC,
 };
@@ -34,6 +35,7 @@ pub enum TocLayout {
 
 #[derive(Debug, Clone)]
 pub struct Archive {
+    pub header_reserved: HeaderReserved,
     pub name: String,
     pub version: u16,
     pub product: u16,
@@ -163,6 +165,7 @@ impl Archive {
             .unwrap_or(TocLayout::Legacy);
 
         Ok(Archive {
+            header_reserved: header.reserved.clone(),
             name: header.name.clone(),
             version,
             product: header.product,
@@ -328,6 +331,7 @@ impl Archive {
             signature: self.signature,
             file_hash_offset,
             file_hash_length,
+            reserved: self.header_reserved.clone(),
         };
 
         header.write_main_header(writer)?;
@@ -357,6 +361,7 @@ impl Archive {
             block_size: DEFAULT_BLOCK_SIZE,
             header_encryption_type: FileEncryptionType::None,
             signature: [0u8; 256],
+            header_reserved: HeaderReserved::default(),
             layout: TocLayout::Modern,
             tocs: vec![Toc {
                 alias: "data".to_string(),
@@ -598,6 +603,7 @@ impl Archive {
             block_size: DEFAULT_BLOCK_SIZE,
             header_encryption_type: FileEncryptionType::None,
             signature: [0u8; 256],
+            header_reserved: HeaderReserved::default(),
             layout: TocLayout::Modern,
             tocs,
         })
@@ -1301,7 +1307,7 @@ fn bfs_strings(
     folder_str: &mut HashMap<(usize, String), u32>,
     file_str: &mut HashMap<(usize, String, String), u32>,
 ) {
-    let mut add = |blob: &mut Vec<u8>, pool: &mut HashMap<String, u32>, s: &str| -> u32 {
+    let add = |blob: &mut Vec<u8>, pool: &mut HashMap<String, u32>, s: &str| -> u32 {
         if let Some(&off) = pool.get(s) {
             return off;
         }
@@ -1439,7 +1445,6 @@ fn build_file<R: Read + Seek>(
 
     let verification_type = if version >= 7 {
         FileVerificationType::from_u8(entry.verification_byte)
-            .unwrap_or(FileVerificationType::None)
     } else {
         FileVerificationType::None
     };

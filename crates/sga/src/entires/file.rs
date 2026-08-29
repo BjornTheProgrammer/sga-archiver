@@ -9,17 +9,18 @@ pub enum FileVerificationType {
     CRCBlocks,
     MD5Blocks,
     SHA1Blocks,
+    Unknown(u8),
 }
 
 impl FileVerificationType {
-    pub fn from_u8(value: u8) -> Result<Self, String> {
+    pub fn from_u8(value: u8) -> Self {
         match value {
-            0 => Ok(Self::None),
-            1 => Ok(Self::CRC),
-            2 => Ok(Self::CRCBlocks),
-            3 => Ok(Self::MD5Blocks),
-            4 => Ok(Self::SHA1Blocks),
-            _ => Err("Invalid file verification type".into()),
+            0 => Self::None,
+            1 => Self::CRC,
+            2 => Self::CRCBlocks,
+            3 => Self::MD5Blocks,
+            4 => Self::SHA1Blocks,
+            _ => Self::Unknown(value),
         }
     }
 
@@ -30,6 +31,7 @@ impl FileVerificationType {
             FileVerificationType::CRCBlocks => 2,
             FileVerificationType::MD5Blocks => 3,
             FileVerificationType::SHA1Blocks => 4,
+            FileVerificationType::Unknown(value) => *value,
         }
     }
 }

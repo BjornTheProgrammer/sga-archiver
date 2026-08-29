@@ -8,11 +8,9 @@ repository.workspace = true
 description = "Library for unpacking '.sga' files from Relic."
 
 [dependencies]
-sga-macros = { version = "0.1.0", path = "../sga-macros" }
 relic-chunky = { version = "0.1.0", path = "../relic-chunky" }
 
 anyhow = { workspace = true }
-byteorder = { workspace = true }
 thiserror = { workspace = true }
 flate2 = { workspace = true }
 brotli = { workspace = true }

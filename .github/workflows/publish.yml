@@ -27,12 +27,8 @@ jobs:
     - name: Test
       run: cargo test --workspace --verbose
 
-    # Publish in dependency order: sga-macros and relic-chunky first, then sga
-    # (which depends on both), then the sga-archiver CLI (which depends on sga).
-    - name: Publish sga-macros
-      run: cargo publish -p sga-macros --verbose
-      env:
-        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    # Publish in dependency order: relic-chunky first, then sga (which depends
+    # on it), then the sga-archiver CLI (which depends on sga).
     - name: Publish relic-chunky
       run: cargo publish -p relic-chunky --verbose
       env:

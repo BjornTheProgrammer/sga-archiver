@@ -655,11 +655,9 @@ dependencies = [
  "anyhow",
  "binrw",
  "brotli",
- "byteorder",
  "csv",
  "flate2",
  "relic-chunky",
- "sga-macros",
  "sha1",
  "thiserror 2.0.12",
 ]
@@ -672,15 +670,6 @@ dependencies = [
  "clap",
  "relic-chunky",
  "sga",
-]
-
-[[package]]
-name = "sga-macros"
-version = "0.1.2"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.100",
 ]
 
 [[package]]

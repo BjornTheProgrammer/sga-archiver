@@ -1,15 +1,7 @@
-use std::io::{self, ErrorKind, Read};
 use binrw::{BinRead, BinResult, BinWrite};
-use byteorder::{LittleEndian, ReadBytesExt};
 
-pub fn read_index<R: Read>(reader: &mut R, version: u16) -> io::Result<u32> {
-    if version < 6 {
-        Ok(reader.read_u16::<LittleEndian>()? as u32)
-    } else {
-        reader.read_u32::<LittleEndian>()
-    }
-}
-
+/// Index fields (counts and lengths) are u16 before archive version 6 and u32
+/// from then on.
 #[binrw::parser(reader, endian)]
 pub fn parse_index(version: u16) -> BinResult<u32> {
     if version < 6 {
@@ -28,6 +20,7 @@ pub fn write_index(value: &u32, version: u16) -> BinResult<()> {
     }
 }
 
+/// Offset fields widen from u32 to u64 at archive version 9.
 #[binrw::parser(reader, endian)]
 pub fn parse_wide(version: u16) -> BinResult<u64> {
     if version >= 9 {
@@ -46,41 +39,15 @@ pub fn write_wide(value: &u64, version: u16) -> BinResult<()> {
     }
 }
 
-/// Reads a fixed section from the buffer.
-/// if char_size is greater than 1, then it reads char_count * char_size bytes.
-pub fn read_fixed_string<R: Read>(reader: &mut R, char_count: usize, char_size: usize) -> io::Result<String> {
-    let total_bytes = char_count * char_size;
-    let mut buffer = vec![0u8; total_bytes];
-    reader.read_exact(&mut buffer)?;
+pub fn utf16_name(units: &[u16; 64]) -> String {
+    let len = units.iter().position(|&unit| unit == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..len])
+}
 
-    let mut effective_char_count = char_count;
-
-    for i in 0..char_count {
-        let slice = &buffer[i * char_size..(i + 1) * char_size];
-        if slice.iter().all(|&b| b == 0) {
-            effective_char_count = i;
-            break;
-        }
+pub fn name_units(name: &str) -> [u16; 64] {
+    let mut units = [0u16; 64];
+    for (slot, unit) in units.iter_mut().zip(name.encode_utf16()) {
+        *slot = unit;
     }
-
-    let string_bytes = &buffer[..effective_char_count * char_size];
-
-    let result = match char_size {
-        1 => String::from_utf8(string_bytes.to_vec())
-            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "Invalid UTF-8")),
-        2 => {
-            use std::slice;
-            if string_bytes.len() % 2 != 0 {
-                return Err(io::Error::new(ErrorKind::InvalidData, "Odd number of bytes for UTF-16"));
-            }
-            let u16_slice: &[u16] = unsafe {
-                slice::from_raw_parts(string_bytes.as_ptr() as *const u16, string_bytes.len() / 2)
-            };
-            String::from_utf16(u16_slice)
-                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "Invalid UTF-16"))
-        },
-        _ => return Err(io::Error::new(ErrorKind::InvalidInput, "Unsupported char_size")),
-    };
-
-    result
+    units
 }

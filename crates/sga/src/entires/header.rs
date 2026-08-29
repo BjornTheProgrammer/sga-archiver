@@ -1,13 +1,12 @@
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 
-use byteorder::{LittleEndian, WriteBytesExt};
-use sga_macros::read_field;
+use binrw::{binrw, BinRead, BinWrite};
 use thiserror::Error;
 
-use crate::{entires::FileEncryptionType, utils::{read_fixed_string, read_index}};
+use crate::entires::FileEncryptionType;
+use crate::utils::{name_units, parse_index, parse_wide, utf16_name, write_index, write_wide};
 
-/// Header of an SGA archive.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SgaHeader {
     /// Magic value of an SGA archive. Should be "_ARCHIVE".
     pub magic: [u8; 8], // "_ARCHIVE" is 8 bytes
@@ -72,200 +71,270 @@ pub struct SgaHeader {
 
     /// Size of the archive's file hash in bytes.
     pub file_hash_length: u32,
+
+    pub reserved: HeaderReserved,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeaderReserved {
+    /// 16-byte block before the name (v<6; likely a checksum).
+    pub pre_name: [u8; 16],
+    /// 16-byte block after the name (v<6; likely a checksum).
+    pub post_name: [u8; 16],
+    /// Two trailing words after the pad (v5 only).
+    pub v5: [u32; 2],
+    /// Word where v11 puts its encryption pair (v<11; observed as 1).
+    pub pad: u32,
+    /// Half-word before the encryption type (v11+; observed always 1).
+    pub v11_one: u16,
+}
+
+impl Default for HeaderReserved {
+    fn default() -> Self {
+        HeaderReserved {
+            pre_name: [0; 16],
+            post_name: [0; 16],
+            v5: [0; 2],
+            // Both observed as 1 in editor/game archives.
+            pad: 1,
+            v11_one: 1,
+        }
+    }
+}
+
+#[binrw]
+#[brw(little, import(version: u16))]
+#[derive(Debug, Clone)]
+struct MainHeaderRest {
+    #[br(if(version < 6, [0u8; 16]))]
+    #[bw(if(version < 6))]
+    pre_name: [u8; 16],
+
+    name: [u16; 64],
+
+    #[br(if(version < 6, [0u8; 16]))]
+    #[bw(if(version < 6))]
+    post_name: [u8; 16],
+
+    #[brw(if(version >= 9))]
+    header_blob_offset64: u64,
+
+    #[brw(if(version == 8))]
+    header_blob_offset32: u32,
+
+    header_blob_length: u32,
+
+    #[br(parse_with = parse_wide, args(version))]
+    #[bw(write_with = write_wide, args(version))]
+    data_offset: u64,
+
+    #[brw(if(version >= 9))]
+    data_blob_length64: u64,
+
+    #[brw(if(version == 5))]
+    header_blob_offset_v5: u32,
+
+    #[brw(if(version == 8))]
+    data_blob_length32: u32,
+
+    #[brw(if(version >= 11))]
+    v11_one: u16,
+
+    #[brw(if(version >= 11))]
+    encryption: u16,
+
+    #[brw(if(version < 11))]
+    pad: u32,
+
+    #[br(if(version == 5, [0u32; 2]))]
+    #[bw(if(version == 5))]
+    v5_extra: [u32; 2],
+
+    #[br(if(version >= 8, [0u8; 256]))]
+    #[bw(if(version >= 8))]
+    signature: [u8; 256],
+}
+
+#[binrw]
+#[brw(little, import(version: u16))]
+#[derive(Debug, Clone)]
+struct IndexTable {
+    toc_data_offset: u32,
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
+    toc_data_count: u32,
+
+    folder_data_offset: u32,
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
+    folder_data_count: u32,
+
+    file_data_offset: u32,
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
+    file_data_count: u32,
+
+    string_offset: u32,
+    #[br(parse_with = parse_index, args(version))]
+    #[bw(write_with = write_index, args(version))]
+    string_length: u32,
+
+    #[brw(if(version >= 7))]
+    file_hash_offset: u32,
+
+    #[brw(if(version >= 8))]
+    file_hash_length: u32,
+
+    #[brw(if(version >= 7))]
+    block_size: u32,
 }
 
 #[derive(Error, Debug)]
 pub enum SgaHeaderParseError {
-    #[error("Magic value of an SGA archive. Should be \"_ARCHIVE\": `{0}`")]
+    #[error("bad magic: expected \"_ARCHIVE\", found {0:?}")]
     MagicValueImproper(String),
-    #[error("Failed to parse a number from stream: `{0}`")]
-    FailedToParseNumber(String),
-    #[error("Failed to parse name from stream: `{0}`")]
-    FailedToName(String),
-    #[error("Failed to parse signature from stream: `{0}`")]
-    SignatureValueImproper(String),
-    #[error("Failed to seek position from stream: `{0}`")]
-    SeekError(String),
-    #[error("Unsupported SGA archive version `{0}` (this crate reads versions 3 through 11)")]
+    #[error("unsupported SGA archive version `{0}` (this crate handles versions 3 through 11)")]
     UnsupportedVersion(u16),
+    #[error("failed to read header: {0}")]
+    Io(#[from] io::Error),
+    #[error("failed to parse header: {0}")]
+    Binrw(#[from] binrw::Error),
+}
+
+fn check_version(version: u16) -> Result<(), SgaHeaderParseError> {
+    if (3..=11).contains(&version) {
+        Ok(())
+    } else {
+        Err(SgaHeaderParseError::UnsupportedVersion(version))
+    }
 }
 
 impl SgaHeader {
     pub fn parse<T: Read + BufRead + Seek>(reader: &mut T) -> Result<Self, SgaHeaderParseError> {
         let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic).map_err(|_| {
-            SgaHeaderParseError::MagicValueImproper("Failed to read 8 bytes for magic".to_string())
-        })?;
-
+        reader.read_exact(&mut magic)?;
         if &magic != b"_ARCHIVE" {
-            let magic_as_str = std::str::from_utf8(&magic).unwrap();
-            let header = SgaHeaderParseError::MagicValueImproper(format!(
-                "Found magic value of {}",
-                magic_as_str
+            return Err(SgaHeaderParseError::MagicValueImproper(
+                String::from_utf8_lossy(&magic).into_owned(),
             ));
-            return Err(header);
         }
+        let mut word = [0u8; 2];
+        reader.read_exact(&mut word)?;
+        let version = u16::from_le_bytes(word);
+        reader.read_exact(&mut word)?;
+        let product = u16::from_le_bytes(word);
+        check_version(version)?;
 
-        let version = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u16)?;
-        let product = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u16)?;
+        let main = MainHeaderRest::read_args(reader, (version,))?;
 
-        if version < 3 || version > 11 {
-            return Err(SgaHeaderParseError::UnsupportedVersion(version));
-        }
-
-        if version < 6 {
-            reader.seek_relative(16).map_err(|err| SgaHeaderParseError::SeekError(err.to_string()))?;
-        }
-
-        let name =
-            read_fixed_string(reader, 64, 2)
-                .map_err(|err| SgaHeaderParseError::FailedToName(err.to_string()))?;
-
-        if version < 6 {
-            reader.seek_relative(16).map_err(|err| SgaHeaderParseError::SeekError(err.to_string()))?;
-        }
-
-        let mut header_blob_offset: Option<u64> = if version >= 9 {
-            Some(read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u64)?)
-        } else if version >= 8 {
-            Some(read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)? as u64)
-        } else {
-            None
+        // v9+ and v8 store the header blob offset directly, v5 stores it after
+        // the data offset; older versions place the blob right where the main
+        // header ends.
+        let stored_offset = match version {
+            9.. => Some(main.header_blob_offset64),
+            8 => Some(main.header_blob_offset32 as u64),
+            5 => Some(main.header_blob_offset_v5 as u64),
+            _ => None,
         };
-
-        let header_blob_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-
-        let data_offset;
-        let mut data_blob_length: u64 = 0;
-        if version >= 9 {
-            data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u64)?;
-            data_blob_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u64)?;
-        } else if version == 5 {
-            data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)? as u64;
-            header_blob_offset = Some(read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)? as u64);
-        } else {
-            data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)? as u64;
-            if version >= 8 {
-                data_blob_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)? as u64;
-            }
-        }
-
-        let mut header_encryption_type = FileEncryptionType::None;
-        if version >= 11 {
-            let _ = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u16); // Always 1
-            let header_encryption_byte = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u16)?;
-            header_encryption_type = FileEncryptionType::from_u8(header_encryption_byte as u8);
-        } else {
-            let _ = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32);
-        }
-
-        if version == 5 {
-            let _ = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32);
-            let _ = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32);
-        }
-
-        let mut signature = [0u8; 256];
-        if version >= 8 {
-            reader.read_exact(&mut signature).map_err(|_| {
-                SgaHeaderParseError::SignatureValueImproper(
-                    "Failed to read 256 bytes for signature".to_string(),
-                )
-            })?;
-        }
-
-        let header_blob_offset = match header_blob_offset {
+        let header_blob_offset = match stored_offset {
             Some(offset) => offset,
-            None => reader.stream_position().map_err(|err| SgaHeaderParseError::SeekError(err.to_string()))?,
+            None => reader.stream_position()?,
         };
+        reader.seek(SeekFrom::Start(header_blob_offset))?;
 
-        reader.seek(SeekFrom::Start(header_blob_offset)).map_err(|err| SgaHeaderParseError::SeekError(err.to_string()))?;
+        let index = IndexTable::read_args(reader, (version,))?;
 
-        // BaseStream.Seek((long)blobOffset, SeekOrigin.Begin);
-
-        let index = |reader: &mut T| read_index(reader, version)
-            .map_err(|err| SgaHeaderParseError::FailedToParseNumber(err.to_string()));
-
-        let toc_data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        let toc_data_count = index(reader)?;
-
-        let folder_data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        let folder_data_count = index(reader)?;
-
-        let file_data_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        let file_data_count = index(reader)?;
-
-        let string_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        let string_length = index(reader)?;
-
-        let mut file_hash_offset = 0u32;
-        let mut file_hash_length = 0u32;
-        let mut block_size = 0u32;
-        if version >= 7 {
-            file_hash_offset = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-            if version >= 8 {
-                file_hash_length = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-            }
-            block_size = read_field!(reader, SgaHeaderParseError::FailedToParseNumber, u32)?;
-        }
-
-        Ok(Self {
+        Ok(SgaHeader {
             magic,
             version,
             product,
-            name,
+            name: utf16_name(&main.name),
             header_blob_offset,
-            header_blob_length,
-            data_offset,
-            data_blob_length,
-            toc_data_offset,
-            toc_data_count,
-            folder_data_offset,
-            folder_data_count,
-            file_data_offset,
-            file_data_count,
-            string_offset,
-            string_length,
-            file_hash_offset,
-            file_hash_length,
-            block_size,
-            header_encryption_type,
-            signature,
+            header_blob_length: main.header_blob_length,
+            data_offset: main.data_offset,
+            data_blob_length: if version >= 9 {
+                main.data_blob_length64
+            } else {
+                main.data_blob_length32 as u64
+            },
+            toc_data_offset: index.toc_data_offset,
+            toc_data_count: index.toc_data_count,
+            folder_data_offset: index.folder_data_offset,
+            folder_data_count: index.folder_data_count,
+            file_data_offset: index.file_data_offset,
+            file_data_count: index.file_data_count,
+            string_offset: index.string_offset,
+            string_length: index.string_length,
+            block_size: index.block_size,
+            header_encryption_type: FileEncryptionType::from_u8(main.encryption as u8),
+            signature: main.signature,
+            file_hash_offset: index.file_hash_offset,
+            file_hash_length: index.file_hash_length,
+            reserved: {
+                let defaults = HeaderReserved::default();
+                HeaderReserved {
+                    pre_name: if version < 6 { main.pre_name } else { defaults.pre_name },
+                    post_name: if version < 6 { main.post_name } else { defaults.post_name },
+                    v5: if version == 5 { main.v5_extra } else { defaults.v5 },
+                    pad: if version < 11 { main.pad } else { defaults.pad },
+                    v11_one: if version >= 11 { main.v11_one } else { defaults.v11_one },
+                }
+            },
         })
     }
 
-    pub fn write_main_header<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&self.magic)?;
-        writer.write_u16::<LittleEndian>(self.version)?;
-        writer.write_u16::<LittleEndian>(self.product)?;
-
-        let mut name_units: Vec<u16> = self.name.encode_utf16().collect();
-        name_units.resize(64, 0);
-        for unit in &name_units[..64] {
-            writer.write_u16::<LittleEndian>(*unit)?;
+    fn main_rest(&self) -> MainHeaderRest {
+        MainHeaderRest {
+            pre_name: self.reserved.pre_name,
+            name: name_units(&self.name),
+            post_name: self.reserved.post_name,
+            header_blob_offset64: self.header_blob_offset,
+            header_blob_offset32: self.header_blob_offset as u32,
+            header_blob_length: self.header_blob_length,
+            data_offset: self.data_offset,
+            data_blob_length64: self.data_blob_length,
+            header_blob_offset_v5: self.header_blob_offset as u32,
+            data_blob_length32: self.data_blob_length as u32,
+            v11_one: self.reserved.v11_one,
+            encryption: self.header_encryption_type.to_u8() as u16,
+            pad: self.reserved.pad,
+            v5_extra: self.reserved.v5,
+            signature: self.signature,
         }
+    }
 
-        writer.write_u64::<LittleEndian>(self.header_blob_offset)?;
-        writer.write_u32::<LittleEndian>(self.header_blob_length)?;
-        writer.write_u64::<LittleEndian>(self.data_offset)?;
-        writer.write_u64::<LittleEndian>(self.data_blob_length)?;
-        writer.write_u16::<LittleEndian>(1)?;
-        writer.write_u16::<LittleEndian>(self.header_encryption_type.to_u8() as u16)?;
-        writer.write_all(&self.signature)?;
+    fn index_table(&self) -> IndexTable {
+        IndexTable {
+            toc_data_offset: self.toc_data_offset,
+            toc_data_count: self.toc_data_count,
+            folder_data_offset: self.folder_data_offset,
+            folder_data_count: self.folder_data_count,
+            file_data_offset: self.file_data_offset,
+            file_data_count: self.file_data_count,
+            string_offset: self.string_offset,
+            string_length: self.string_length,
+            file_hash_offset: self.file_hash_offset,
+            file_hash_length: self.file_hash_length,
+            block_size: self.block_size,
+        }
+    }
+
+    pub fn write_main_header<W: Write + Seek>(&self, writer: &mut W) -> io::Result<()> {
+        check_version(self.version).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        writer.write_all(&self.magic)?;
+        writer.write_all(&self.version.to_le_bytes())?;
+        writer.write_all(&self.product.to_le_bytes())?;
+        self.main_rest()
+            .write_args(writer, (self.version,))
+            .map_err(io::Error::other)?;
         Ok(())
     }
 
-    pub fn write_index_table<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_u32::<LittleEndian>(self.toc_data_offset)?;
-        writer.write_u32::<LittleEndian>(self.toc_data_count)?;
-        writer.write_u32::<LittleEndian>(self.folder_data_offset)?;
-        writer.write_u32::<LittleEndian>(self.folder_data_count)?;
-        writer.write_u32::<LittleEndian>(self.file_data_offset)?;
-        writer.write_u32::<LittleEndian>(self.file_data_count)?;
-        writer.write_u32::<LittleEndian>(self.string_offset)?;
-        writer.write_u32::<LittleEndian>(self.string_length)?;
-        writer.write_u32::<LittleEndian>(self.file_hash_offset)?;
-        writer.write_u32::<LittleEndian>(self.file_hash_length)?;
-        writer.write_u32::<LittleEndian>(self.block_size)?;
+    pub fn write_index_table<W: Write + Seek>(&self, writer: &mut W) -> io::Result<()> {
+        check_version(self.version).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        self.index_table()
+            .write_args(writer, (self.version,))
+            .map_err(io::Error::other)?;
         Ok(())
     }
 }

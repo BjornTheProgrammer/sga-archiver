@@ -49,6 +49,7 @@ fn sample(layout: TocLayout) -> Archive {
         block_size: 0,
         header_encryption_type: FileEncryptionType::None,
         signature: [0u8; 256],
+        header_reserved: sga::entires::HeaderReserved::default(),
         layout,
         tocs: vec![Toc { alias: "data".into(), name: "data".into(), root }],
     }
