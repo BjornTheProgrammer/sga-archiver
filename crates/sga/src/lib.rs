@@ -7,7 +7,7 @@ pub mod entires;
 pub mod localization;
 pub(crate) mod utils;
 
-pub use archive::{Archive, FileEntry, Folder, Toc};
+pub use archive::{Archive, FileEntry, Folder, Toc, TocLayout};
 
 pub fn read_header<P: AsRef<Path>>(sga_file: P) -> Result<entires::SgaHeader> {
     let mut sga_file = BufReader::new(File::open(sga_file)?);
