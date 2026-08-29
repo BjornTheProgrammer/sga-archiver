@@ -14,17 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Build sga-macros
-      run: cargo build -p sga-macros --verbose
-    - name: Test sga-macros
-      run: cargo test -p sga-macros --verbose 
-
-    - name: Build sga
-      run: cargo build -p sga --verbose
-    - name: Test sga
-      run: cargo test -p sga --verbose
-
-    - name: Build sga-unpacker-cli
-      run: cargo build -p sga-unpacker --verbose
-    - name: Test sga-unpacker-cli
-      run: cargo test -p sga-unpacker --verbose
+    - name: Build
+      run: cargo build --workspace --verbose
+    - name: Test
+      run: cargo test --workspace --verbose
