@@ -194,9 +194,12 @@ impl Archive {
         let mut file_data_off: HashMap<(usize, String, String), u64> = HashMap::new();
         let mut all_files: Vec<(usize, String, String, &FileEntry)> = Vec::new();
         for (ti, toc) in self.tocs.iter().enumerate() {
-            match self.layout {
-                TocLayout::Legacy => collect_files_dfs(ti, &toc.root, "", &mut all_files),
-                TocLayout::Modern => collect_files_bfs(ti, &toc.root, &mut all_files),
+            for event in walk(self.layout, &toc.root) {
+                if let WalkEvent::Visit(full, folder) = event {
+                    for file in &folder.files {
+                        all_files.push((ti, full.clone(), file.name.clone(), file));
+                    }
+                }
             }
         }
         if all_files.iter().all(|(_, _, _, f)| f.data_order.is_some()) {
@@ -217,43 +220,36 @@ impl Archive {
         let mut toc_file_ranges: Vec<(u32, u32)> = Vec::new();
         for (ti, toc) in self.tocs.iter().enumerate() {
             let start = file_entries.len() as u32;
-            match self.layout {
-                TocLayout::Legacy => dfs_files(
-                    ti,
-                    &toc.root,
-                    "",
-                    &mut file_entries,
-                    &mut folder_file_range,
-                    &file_str,
-                    &file_data_off,
-                    &mut hash_blob,
-                    block_size,
-                ),
-                TocLayout::Modern => bfs_files(
-                    ti,
-                    &toc.root,
-                    &mut file_entries,
-                    &mut folder_file_range,
-                    &file_str,
-                    &file_data_off,
-                    &mut hash_blob,
-                    block_size,
-                ),
+            for event in walk(self.layout, &toc.root) {
+                let WalkEvent::Visit(full, folder) = event else { continue };
+                let folder_start = file_entries.len() as u32;
+                for file in &folder.files {
+                    let key = (ti, full.clone(), file.name.clone());
+                    push_file_entry(
+                        file,
+                        &key,
+                        &mut file_entries,
+                        &file_str,
+                        &file_data_off,
+                        &mut hash_blob,
+                        block_size,
+                    );
+                }
+                folder_file_range.insert((ti, full), (folder_start, file_entries.len() as u32));
             }
             toc_file_ranges.push((start, file_entries.len() as u32));
         }
 
         let mut folder_range: HashMap<(usize, String), (u32, u32)> = HashMap::new();
-        let mut base = 0u32;
+        let mut counter = 0u32;
         for (ti, toc) in self.tocs.iter().enumerate() {
-            let mut counter = base + 1;
-            match self.layout {
-                TocLayout::Legacy => {
-                    dfs_folder_ranges(ti, &toc.root, "", &mut counter, &mut folder_range)
-                }
-                TocLayout::Modern => bfs_folder_ranges(ti, &toc.root, &mut counter, &mut folder_range),
+            counter += 1;
+            for event in walk(self.layout, &toc.root) {
+                let WalkEvent::Visit(full, folder) = event else { continue };
+                let start = counter;
+                counter += folder.folders.len() as u32;
+                folder_range.insert((ti, full), (start, counter));
             }
-            base = counter;
         }
 
         // Folder table: emitted so each folder's children occupy the contiguous
@@ -274,9 +270,11 @@ impl Archive {
             };
 
             folder_entries.push(mk(""));
-            match self.layout {
-                TocLayout::Legacy => emit_child_folders_dfs(&toc.root, "", &mut folder_entries, &mk),
-                TocLayout::Modern => emit_child_folders_bfs(&toc.root, &mut folder_entries, &mk),
+            for event in walk(self.layout, &toc.root) {
+                let WalkEvent::Visit(full, folder) = event else { continue };
+                for child in &folder.folders {
+                    folder_entries.push(mk(&child_path(&full, &child.name)));
+                }
             }
 
             let (toc_file_start, toc_file_end) = toc_file_ranges[ti];
@@ -1030,32 +1028,85 @@ fn encode(data: &[u8], storage: &FileStorageType) -> Result<Vec<u8>> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn bfs_files(
-    ti: usize,
-    root: &Folder,
-    file_entries: &mut Vec<SgaFileEntry>,
-    folder_file_range: &mut HashMap<(usize, String), (u32, u32)>,
-    file_str: &HashMap<(usize, String, String), u32>,
-    file_data_off: &HashMap<(usize, String, String), u64>,
-    hash_blob: &mut Vec<u8>,
-    block_size: usize,
-) {
-    let mut queue = std::collections::VecDeque::from([(String::new(), root)]);
-    while let Some((full, folder)) = queue.pop_front() {
-        let start = file_entries.len() as u32;
-        for file in &folder.files {
-            let key = (ti, full.clone(), file.name.clone());
-            push_file_entry(file, &key, file_entries, file_str, file_data_off, hash_blob, block_size);
+enum WalkEvent<'a> {
+    Discover(String),
+    Visit(String, &'a Folder),
+}
+
+/// The single place the two layout generations' traversals exist. Legacy
+/// walks depth-first and discovers each folder immediately before its own
+/// visit; Modern walks breadth-first and discovers children during their
+fn walk<'a>(layout: TocLayout, root: &'a Folder) -> Vec<WalkEvent<'a>> {
+    let mut events = Vec::new();
+    match layout {
+        TocLayout::Legacy => {
+            fn dfs<'a>(full: String, folder: &'a Folder, events: &mut Vec<WalkEvent<'a>>) {
+                events.push(WalkEvent::Discover(full.clone()));
+                events.push(WalkEvent::Visit(full.clone(), folder));
+                for child in &folder.folders {
+                    dfs(child_path(&full, &child.name), child, events);
+                }
+            }
+            dfs(String::new(), root, &mut events);
         }
-        folder_file_range.insert((ti, full.clone()), (start, file_entries.len() as u32));
-        for child in &folder.folders {
-            let child_full = if full.is_empty() {
-                child.name.clone()
-            } else {
-                format!("{full}\\{}", child.name)
-            };
-            queue.push_back((child_full, child));
+        TocLayout::Modern => {
+            events.push(WalkEvent::Discover(String::new()));
+            let mut queue = std::collections::VecDeque::from([(String::new(), root)]);
+            while let Some((full, folder)) = queue.pop_front() {
+                events.push(WalkEvent::Visit(full.clone(), folder));
+                for child in &folder.folders {
+                    let full = child_path(&full, &child.name);
+                    events.push(WalkEvent::Discover(full.clone()));
+                    queue.push_back((full, child));
+                }
+            }
+        }
+    }
+    events
+}
+
+fn child_path(full: &str, name: &str) -> String {
+    if full.is_empty() {
+        name.to_string()
+    } else {
+        format!("{full}\\{name}")
+    }
+}
+
+fn build_strings(
+    layout: TocLayout,
+    tocs: &[Toc],
+    blob: &mut Vec<u8>,
+    folder_str: &mut HashMap<(usize, String), u32>,
+    file_str: &mut HashMap<(usize, String, String), u32>,
+) {
+    let mut pool: HashMap<String, u32> = HashMap::new();
+    let mut add = |blob: &mut Vec<u8>, value: &str| -> u32 {
+        if layout == TocLayout::Modern {
+            if let Some(&offset) = pool.get(value) {
+                return offset;
+            }
+            let offset = append_str(blob, value);
+            pool.insert(value.to_string(), offset);
+            offset
+        } else {
+            append_str(blob, value)
+        }
+    };
+    for (ti, toc) in tocs.iter().enumerate() {
+        for event in walk(layout, &toc.root) {
+            match event {
+                WalkEvent::Discover(path) => {
+                    let offset = add(blob, &path);
+                    folder_str.insert((ti, path), offset);
+                }
+                WalkEvent::Visit(path, folder) => {
+                    for file in &folder.files {
+                        let offset = add(blob, &file.name);
+                        file_str.insert((ti, path.clone(), file.name.clone()), offset);
+                    }
+                }
+            }
         }
     }
 }
@@ -1089,205 +1140,6 @@ fn push_file_entry(
         hash_offset_v7: 0,
     });
 }
-
-fn build_strings(
-    layout: TocLayout,
-    tocs: &[Toc],
-    blob: &mut Vec<u8>,
-    folder_str: &mut HashMap<(usize, String), u32>,
-    file_str: &mut HashMap<(usize, String, String), u32>,
-) {
-    let mut pool: HashMap<String, u32> = HashMap::new();
-    for (ti, toc) in tocs.iter().enumerate() {
-        match layout {
-            TocLayout::Legacy => dfs_strings(ti, &toc.root, "", blob, folder_str, file_str),
-            TocLayout::Modern => bfs_strings(ti, &toc.root, blob, &mut pool, folder_str, file_str),
-        }
-    }
-}
-
-fn dfs_strings(
-    ti: usize,
-    folder: &Folder,
-    full: &str,
-    blob: &mut Vec<u8>,
-    folder_str: &mut HashMap<(usize, String), u32>,
-    file_str: &mut HashMap<(usize, String, String), u32>,
-) {
-    folder_str.insert((ti, full.to_string()), append_str(blob, full));
-    for file in &folder.files {
-        file_str.insert((ti, full.to_string(), file.name.clone()), append_str(blob, &file.name));
-    }
-    for child in &folder.folders {
-        let child_full = if full.is_empty() {
-            child.name.clone()
-        } else {
-            format!("{full}\\{}", child.name)
-        };
-        dfs_strings(ti, child, &child_full, blob, folder_str, file_str);
-    }
-}
-
-fn dfs_folder_ranges(
-    ti: usize,
-    folder: &Folder,
-    full: &str,
-    counter: &mut u32,
-    out: &mut HashMap<(usize, String), (u32, u32)>,
-) {
-    let start = *counter;
-    *counter += folder.folders.len() as u32;
-    out.insert((ti, full.to_string()), (start, *counter));
-    for child in &folder.folders {
-        let child_full = if full.is_empty() {
-            child.name.clone()
-        } else {
-            format!("{full}\\{}", child.name)
-        };
-        dfs_folder_ranges(ti, child, &child_full, counter, out);
-    }
-}
-
-fn emit_child_folders_dfs(
-    folder: &Folder,
-    full: &str,
-    entries: &mut Vec<SgaFolderEntry>,
-    mk: &impl Fn(&str) -> SgaFolderEntry,
-) {
-    let mut child_fulls = Vec::with_capacity(folder.folders.len());
-    for child in &folder.folders {
-        let child_full = if full.is_empty() {
-            child.name.clone()
-        } else {
-            format!("{full}\\{}", child.name)
-        };
-        entries.push(mk(&child_full));
-        child_fulls.push(child_full);
-    }
-    for (child, child_full) in folder.folders.iter().zip(&child_fulls) {
-        emit_child_folders_dfs(child, child_full, entries, mk);
-    }
-}
-
-fn collect_files_dfs<'a>(
-    ti: usize,
-    folder: &'a Folder,
-    full: &str,
-    out: &mut Vec<(usize, String, String, &'a FileEntry)>,
-) {
-    for file in &folder.files {
-        out.push((ti, full.to_string(), file.name.clone(), file));
-    }
-    for child in &folder.folders {
-        let child_full = if full.is_empty() {
-            child.name.clone()
-        } else {
-            format!("{full}\\{}", child.name)
-        };
-        collect_files_dfs(ti, child, &child_full, out);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn dfs_files(
-    ti: usize,
-    folder: &Folder,
-    full: &str,
-    file_entries: &mut Vec<SgaFileEntry>,
-    folder_file_range: &mut HashMap<(usize, String), (u32, u32)>,
-    file_str: &HashMap<(usize, String, String), u32>,
-    file_data_off: &HashMap<(usize, String, String), u64>,
-    hash_blob: &mut Vec<u8>,
-    block_size: usize,
-) {
-    let start = file_entries.len() as u32;
-    for file in &folder.files {
-        let key = (ti, full.to_string(), file.name.clone());
-        push_file_entry(file, &key, file_entries, file_str, file_data_off, hash_blob, block_size);
-    }
-    folder_file_range.insert((ti, full.to_string()), (start, file_entries.len() as u32));
-    for child in &folder.folders {
-        let child_full = if full.is_empty() {
-            child.name.clone()
-        } else {
-            format!("{full}\\{}", child.name)
-        };
-        dfs_files(
-            ti,
-            child,
-            &child_full,
-            file_entries,
-            folder_file_range,
-            file_str,
-            file_data_off,
-            hash_blob,
-            block_size,
-        );
-    }
-}
-
-fn bfs_folder_ranges(
-    ti: usize,
-    root: &Folder,
-    counter: &mut u32,
-    out: &mut HashMap<(usize, String), (u32, u32)>,
-) {
-    let mut queue = std::collections::VecDeque::from([(String::new(), root)]);
-    while let Some((full, folder)) = queue.pop_front() {
-        let start = *counter;
-        *counter += folder.folders.len() as u32;
-        out.insert((ti, full.clone()), (start, *counter));
-        for child in &folder.folders {
-            let child_full = if full.is_empty() {
-                child.name.clone()
-            } else {
-                format!("{full}\\{}", child.name)
-            };
-            queue.push_back((child_full, child));
-        }
-    }
-}
-
-fn emit_child_folders_bfs(
-    root: &Folder,
-    entries: &mut Vec<SgaFolderEntry>,
-    mk: &impl Fn(&str) -> SgaFolderEntry,
-) {
-    let mut queue = std::collections::VecDeque::from([(String::new(), root)]);
-    while let Some((full, folder)) = queue.pop_front() {
-        for child in &folder.folders {
-            let child_full = if full.is_empty() {
-                child.name.clone()
-            } else {
-                format!("{full}\\{}", child.name)
-            };
-            entries.push(mk(&child_full));
-            queue.push_back((child_full, child));
-        }
-    }
-}
-
-fn collect_files_bfs<'a>(
-    ti: usize,
-    root: &'a Folder,
-    out: &mut Vec<(usize, String, String, &'a FileEntry)>,
-) {
-    let mut queue = std::collections::VecDeque::from([(String::new(), root)]);
-    while let Some((full, folder)) = queue.pop_front() {
-        for file in &folder.files {
-            out.push((ti, full.clone(), file.name.clone(), file));
-        }
-        for child in &folder.folders {
-            let child_full = if full.is_empty() {
-                child.name.clone()
-            } else {
-                format!("{full}\\{}", child.name)
-            };
-            queue.push_back((child_full, child));
-        }
-    }
-}
-
 /// Appends a NUL-terminated string to the blob, returning its offset.
 fn append_str(blob: &mut Vec<u8>, value: &str) -> u32 {
     let offset = blob.len() as u32;
@@ -1297,46 +1149,6 @@ fn append_str(blob: &mut Vec<u8>, value: &str) -> u32 {
 }
 
 /// Depth-first pass building the string blob: each folder emits its full path,
-/// then its file names, then recurses into child folders — no deduplication.
-/// Records each string's offset keyed by `(toc, path[, file name])`.
-fn bfs_strings(
-    ti: usize,
-    root: &Folder,
-    blob: &mut Vec<u8>,
-    pool: &mut HashMap<String, u32>,
-    folder_str: &mut HashMap<(usize, String), u32>,
-    file_str: &mut HashMap<(usize, String, String), u32>,
-) {
-    let add = |blob: &mut Vec<u8>, pool: &mut HashMap<String, u32>, s: &str| -> u32 {
-        if let Some(&off) = pool.get(s) {
-            return off;
-        }
-        let off = append_str(blob, s);
-        pool.insert(s.to_string(), off);
-        off
-    };
-
-    let root_off = add(blob, pool, "");
-    folder_str.insert((ti, String::new()), root_off);
-
-    let mut queue = std::collections::VecDeque::from([(String::new(), root)]);
-    while let Some((full, folder)) = queue.pop_front() {
-        for file in &folder.files {
-            let off = add(blob, pool, &file.name);
-            file_str.insert((ti, full.clone(), file.name.clone()), off);
-        }
-        for child in &folder.folders {
-            let child_full = if full.is_empty() {
-                child.name.clone()
-            } else {
-                format!("{full}\\{}", child.name)
-            };
-            let off = add(blob, pool, &child_full);
-            folder_str.insert((ti, child_full.clone()), off);
-            queue.push_back((child_full, child));
-        }
-    }
-}
 
 fn block_sha1(data: &[u8], block_size: usize) -> Vec<u8> {
     let block_size = block_size.max(1);
