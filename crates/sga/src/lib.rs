@@ -3,6 +3,7 @@ use std::{fs::File, io::BufReader, path::{Path, PathBuf}};
 use anyhow::Result;
 
 mod archive;
+mod build;
 pub mod entires;
 pub mod localization;
 pub(crate) mod utils;
@@ -26,14 +27,14 @@ pub fn extract_all<P: AsRef<Path>>(sga_file: P, out_path: P) -> Result<Vec<PathB
 }
 
 pub fn pack_dir<P: AsRef<Path>, Q: AsRef<Path>>(name: &str, dir: P, out_path: Q) -> Result<()> {
-    let archive = Archive::from_dir(name, dir)?;
+    let archive = build::from_dir(name, dir)?;
     let mut writer = File::create(out_path)?;
     archive.write(&mut writer)?;
     Ok(())
 }
 
 pub fn compile<P: AsRef<Path>, Q: AsRef<Path>>(source_dir: P, out_path: Q) -> Result<()> {
-    let archive = Archive::compile_project(source_dir)?;
+    let archive = build::compile_project(source_dir)?;
     let mut writer = File::create(out_path)?;
     archive.write(&mut writer)?;
     Ok(())
