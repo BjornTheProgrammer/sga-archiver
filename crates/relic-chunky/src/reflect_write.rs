@@ -9,7 +9,7 @@ use quick_xml::Reader;
 
 use crate::container::{Chunk, ChunkBody, ChunkKind, Chunky};
 use crate::records::{HashedString, InternedStringTable, ObjectRecord, ObjectTable};
-use crate::reflect_type::SchemaRegistry;
+use crate::reflect_type::{classify_field, is_enum_type, FieldKind, SchemaRegistry};
 
 /// The reflection data blob (`RFCI`) is the first chunk, so its bytes begin
 /// after the file header (24) and the chunk header (20).
@@ -23,15 +23,15 @@ const RFCI_PREFIX: u32 = 4;
 
 /// One `<DataObject>` from the `.rdo`, with its scalar/bool/string fields keyed
 /// by field name and its object-valued fields kept as ordered `(field, id)`
-/// pairs (a field may name several children when it is an array).
 #[derive(Debug, Default)]
 struct RdoObject {
     id: u64,
     type_name: String,
     owner_id: u64,
-    scalars: HashMap<String, u32>,
+    scalars: HashMap<String, u64>,
     bools: HashMap<String, bool>,
     strings: HashMap<String, String>,
+    raws: HashMap<String, (u32, Vec<u8>)>,
     children: Vec<(String, u64)>,
 }
 
@@ -55,6 +55,17 @@ fn unescape(raw: &str) -> String {
         .replace("&amp;", "&")
 }
 
+fn hex_decode(s: &str) -> Vec<u8> {
+    s.as_bytes()
+        .chunks(2)
+        .filter_map(|pair| {
+            let hi = (*pair.first()? as char).to_digit(16)?;
+            let lo = (*pair.get(1)? as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
+        .collect()
+}
+
 fn attr(tag: &BytesStart, name: &str) -> Option<String> {
     tag.attributes().flatten().find_map(|a| {
         if a.key.as_ref() == name.as_bytes() {
@@ -75,13 +86,16 @@ fn store_scalar(object: &mut RdoObject, prop_type: &str, name: String, value: &s
             object.strings.insert(name, value.to_string());
         }
         "Float" => {
-            object.scalars.insert(name, value.parse::<f32>().unwrap_or(0.0).to_bits());
+            object.scalars.insert(name, value.parse::<f32>().unwrap_or(0.0).to_bits() as u64);
         }
         "Int32" => {
-            object.scalars.insert(name, value.parse::<i32>().unwrap_or(0) as u32);
+            object.scalars.insert(name, value.parse::<i32>().unwrap_or(0) as u32 as u64);
+        }
+        "Int64" => {
+            object.scalars.insert(name, value.parse::<i64>().unwrap_or(0) as u64);
         }
         _ => {
-            object.scalars.insert(name, value.parse::<u32>().unwrap_or(0));
+            object.scalars.insert(name, value.parse::<u64>().unwrap_or(0));
         }
     }
 }
@@ -91,9 +105,8 @@ fn parse_rdo(xml: &str) -> Result<Vec<RdoObject>> {
     let mut objects: Vec<RdoObject> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
     // Open object-valued properties: (owning object index, field name). A
-    // `<DataObject>` seen while one is open is a child of that object via that
-    // field; the stack handles nested object properties.
     let mut open_fields: Vec<(usize, String)> = Vec::new();
+    let mut in_data_value = false;
 
     loop {
         match reader.read_event() {
@@ -106,10 +119,21 @@ fn parse_rdo(xml: &str) -> Result<Vec<RdoObject>> {
                     owner_id: attr(&tag, "OwnerId").and_then(|s| s.parse().ok()).unwrap_or(0),
                     ..Default::default()
                 });
-                if let Some((parent, field)) = open_fields.last() {
+                stack.push(idx);
+            }
+            Ok(Event::Start(tag)) if tag.name().as_ref() == b"DataValue" => {
+                in_data_value = true;
+            }
+            Ok(Event::Text(text)) if in_data_value => {
+                let raw = String::from_utf8_lossy(text.as_ref());
+                if let (Some((parent, field)), Ok(id)) =
+                    (open_fields.last(), raw.trim().parse::<u64>())
+                {
                     objects[*parent].children.push((field.clone(), id));
                 }
-                stack.push(idx);
+            }
+            Ok(Event::End(tag)) if tag.name().as_ref() == b"DataValue" => {
+                in_data_value = false;
             }
             Ok(Event::Start(tag)) if tag.name().as_ref() == b"DataProperty" => {
                 if attr(&tag, "Type").as_deref() == Some("Object") {
@@ -128,7 +152,13 @@ fn parse_rdo(xml: &str) -> Result<Vec<RdoObject>> {
                 if let (Some(&current), Some(name), Some(value)) =
                     (stack.last(), attr(&tag, "Name"), attr(&tag, "Value"))
                 {
-                    store_scalar(&mut objects[current], &prop_type, name, &value);
+                    if prop_type == "Bytes" {
+                        let count =
+                            attr(&tag, "Count").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        objects[current].raws.insert(name, (count, hex_decode(&value)));
+                    } else {
+                        store_scalar(&mut objects[current], &prop_type, name, &value);
+                    }
                 }
             }
             Ok(Event::End(tag)) if tag.name().as_ref() == b"DataObject" => {
@@ -150,64 +180,21 @@ fn parse_rdo(xml: &str) -> Result<Vec<RdoObject>> {
 // Field classification and alignment
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Scalar,
-    Bool,
-    Str,
-    Enum,
-    Embed,
-    OffsetPointer,
-    Array,
-    PointerArray,
-    Opaque,
+fn classify(type_name: &str, reg: &SchemaRegistry) -> FieldKind {
+    classify_field(type_name, |n| reg.by_name(n).is_some_and(|t| !t.fields.is_empty()))
 }
 
-fn is_enum(type_name: &str) -> bool {
-    type_name.contains("FamilyManagerEnum") || type_name.contains("ReflectStringHash")
-}
-
-fn classify(type_name: &str, reg: &SchemaRegistry) -> Kind {
-    if type_name.contains("ReflectArray") {
-        if type_name.contains('*') {
-            Kind::PointerArray
-        } else {
-            Kind::Array
-        }
-    } else if is_enum(type_name) {
-        Kind::Enum
-    } else if type_name.contains("ReflectString") {
-        Kind::Str
-    } else if type_name.contains("ReflectOffsetPointer") {
-        Kind::OffsetPointer
-    } else if type_name == "bool" {
-        Kind::Bool
-    } else if type_name == "float"
-        || type_name.contains("int32")
-        || type_name.contains("uint32")
-    {
-        Kind::Scalar
-    } else if reg.by_name(type_name).is_some_and(|t| !t.fields.is_empty()) {
-        Kind::Embed
-    } else {
-        Kind::Opaque
-    }
-}
-
-/// Alignment demanded by a single field, from its type name.
-fn field_align(type_name: &str) -> u32 {
-    if type_name.contains("ReflectOffsetPointer")
-        || type_name.contains("ReflectString")
-        || type_name.contains("ReflectArray")
-        || type_name.contains('*')
-        || type_name.contains("int64")
-        || type_name.contains("uint64")
-    {
-        8
-    } else if type_name == "float" || type_name.contains("int32") || type_name.contains("uint32") {
-        4
-    } else {
-        1
+fn field_align(reg: &SchemaRegistry, type_name: &str) -> u32 {
+    match classify(type_name, reg) {
+        FieldKind::Str
+        | FieldKind::Array
+        | FieldKind::PointerArray
+        | FieldKind::OffsetPointer
+        | FieldKind::Scalar64
+        | FieldKind::Enum => 8,
+        FieldKind::Scalar => 4,
+        FieldKind::Bool | FieldKind::Scalar8 | FieldKind::Opaque => 1,
+        FieldKind::Embed => type_align(reg, type_name),
     }
 }
 
@@ -216,7 +203,7 @@ fn field_align(type_name: &str) -> u32 {
 fn type_align(reg: &SchemaRegistry, type_name: &str) -> u32 {
     match reg.by_name(type_name) {
         Some(ty) if !ty.fields.is_empty() => {
-            ty.fields.iter().map(|f| field_align(&f.type_name)).max().unwrap_or(1)
+            ty.fields.iter().map(|f| field_align(reg, &f.type_name)).max().unwrap_or(1)
         }
         _ => 8,
     }
@@ -240,6 +227,7 @@ use crate::hash::city_hash64;
 enum Item {
     Str { eff: u32, fpos: u32, val: String },
     Array { eff: u32, fpos: u32, children: Vec<u64> },
+    RawArray { eff: u32, fpos: u32, count: u32, bytes: Vec<u8> },
     Pointers { eff: u32, fpos: u32, children: Vec<u64> },
     OffsetPointer { eff: u32, fpos: u32, children: Vec<u64> },
 }
@@ -249,6 +237,7 @@ impl Item {
         match self {
             Item::Str { eff, .. }
             | Item::Array { eff, .. }
+            | Item::RawArray { eff, .. }
             | Item::Pointers { eff, .. }
             | Item::OffsetPointer { eff, .. } => *eff,
         }
@@ -260,6 +249,7 @@ struct Ctx<'a> {
     objects: &'a [RdoObject],
     by_id: &'a HashMap<u64, usize>,
     registry: &'a SchemaRegistry,
+    reified: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -341,6 +331,27 @@ impl State {
     }
 }
 
+fn write_empty_array(st: &mut State, ctx: &Ctx, fpos: u32) {
+    if ctx.reified {
+        let at = st.append(8);
+        st.wi32(fpos, at as i32 - fpos as i32);
+    } else {
+        st.wi32(fpos, 0);
+    }
+    st.wi32(fpos + 8, 0);
+}
+
+fn reified_child(ctx: &Ctx, object: &RdoObject, field: &str) -> Option<usize> {
+    let ids = object.child_ids(field);
+    let [id] = ids[..] else { return None };
+    let ci = *ctx.by_id.get(&id)?;
+    matches!(
+        classify(&ctx.objects[ci].type_name, ctx.registry),
+        FieldKind::Str | FieldKind::Array | FieldKind::PointerArray
+    )
+    .then_some(ci)
+}
+
 /// Writes an object's inline data at `off`, recursing into embedded structs and
 /// enums (which live inside the parent's footprint), and collecting every
 /// out-of-line field into `out` with its blob offset for later placement.
@@ -350,12 +361,54 @@ fn inline_write(st: &mut State, ctx: &Ctx, idx: usize, off: u32, out: &mut Vec<I
     let size = ctx.registry.by_name(&object.type_name).map(|t| t.size).unwrap_or(8);
     st.ensure(off + size);
 
-    if is_enum(&object.type_name) {
-        let name = object.strings.get("m_enumName").cloned().unwrap_or_default();
-        let hash = city_hash64(name.to_lowercase().as_bytes());
-        st.w64(off, hash);
-        st.intern(hash, name);
+    if is_enum_type(&object.type_name) {
+        if let Some(&hash) = object.scalars.get("m_hashValue") {
+            st.w64(off, hash);
+        } else {
+            let name = object.strings.get("m_enumName").cloned().unwrap_or_default();
+            let hash = city_hash64(name.to_lowercase().as_bytes());
+            st.w64(off, hash);
+            st.intern(hash, name);
+        }
         return;
+    }
+
+    match classify(&object.type_name, ctx.registry) {
+        FieldKind::Str => {
+            out.push(Item::Str {
+                eff: off,
+                fpos: off,
+                val: object.strings.get("m_value").cloned().unwrap_or_default(),
+            });
+            return;
+        }
+        FieldKind::Array => {
+            let children = object.child_ids("m_elements");
+            if children.is_empty() {
+                if let Some((count, bytes)) = object.raws.get("m_elements") {
+                    out.push(Item::RawArray {
+                        eff: off,
+                        fpos: off,
+                        count: *count,
+                        bytes: bytes.clone(),
+                    });
+                    return;
+                }
+            }
+            out.push(Item::Array { eff: off, fpos: off, children });
+            return;
+        }
+        FieldKind::PointerArray => {
+            out.push(Item::Pointers { eff: off, fpos: off, children: object.child_ids("m_elements") });
+            return;
+        }
+        FieldKind::Opaque => {
+            if let Some((_, bytes)) = object.raws.get("#Raw") {
+                st.wbytes(off, bytes);
+            }
+            return;
+        }
+        _ => {}
     }
 
     let Some(ty) = ctx.registry.by_name(&object.type_name) else {
@@ -365,49 +418,86 @@ fn inline_write(st: &mut State, ctx: &Ctx, idx: usize, off: u32, out: &mut Vec<I
     for field in &ty.fields {
         let fpos = off + field.offset;
         match classify(&field.type_name, ctx.registry) {
-            Kind::Scalar => st.w32(fpos, object.scalars.get(&field.name).copied().unwrap_or(0)),
-            Kind::Bool => st.w8(fpos, object.bools.get(&field.name).copied().unwrap_or(false) as u8),
-            Kind::Str => out.push(Item::Str {
-                eff: fpos,
-                fpos,
-                val: object.strings.get(&field.name).cloned().unwrap_or_default(),
-            }),
-            Kind::Embed | Kind::Enum => {
+            FieldKind::Scalar => {
+                st.w32(fpos, object.scalars.get(&field.name).copied().unwrap_or(0) as u32)
+            }
+            FieldKind::Scalar64 => {
+                st.w64(fpos, object.scalars.get(&field.name).copied().unwrap_or(0))
+            }
+            FieldKind::Scalar8 => {
+                st.w8(fpos, object.scalars.get(&field.name).copied().unwrap_or(0) as u8)
+            }
+            FieldKind::Bool => {
+                st.w8(fpos, object.bools.get(&field.name).copied().unwrap_or(false) as u8)
+            }
+            FieldKind::Str => match reified_child(ctx, object, &field.name) {
+                Some(ci) => inline_write(st, ctx, ci, fpos, out),
+                None => out.push(Item::Str {
+                    eff: fpos,
+                    fpos,
+                    val: object.strings.get(&field.name).cloned().unwrap_or_default(),
+                }),
+            },
+            FieldKind::Embed | FieldKind::Enum => {
                 if let Some(&child) = object.child_ids(&field.name).first() {
                     if let Ok(ci) = ctx.get(child) {
                         inline_write(st, ctx, ci, fpos, out);
                     }
                 }
             }
-            Kind::Array => out.push(Item::Array {
+            FieldKind::Array => match reified_child(ctx, object, &field.name) {
+                Some(ci) => inline_write(st, ctx, ci, fpos, out),
+                None => {
+                    let children = object.child_ids(&field.name);
+                    match object.raws.get(&field.name) {
+                        Some((count, bytes)) if children.is_empty() => {
+                            out.push(Item::RawArray {
+                                eff: fpos,
+                                fpos,
+                                count: *count,
+                                bytes: bytes.clone(),
+                            })
+                        }
+                        _ => out.push(Item::Array { eff: fpos, fpos, children }),
+                    }
+                }
+            },
+            FieldKind::PointerArray => match reified_child(ctx, object, &field.name) {
+                Some(ci) => inline_write(st, ctx, ci, fpos, out),
+                None => out.push(Item::Pointers {
+                    eff: fpos,
+                    fpos,
+                    children: object.child_ids(&field.name),
+                }),
+            },
+            FieldKind::OffsetPointer => out.push(Item::OffsetPointer {
                 eff: fpos,
                 fpos,
                 children: object.child_ids(&field.name),
             }),
-            Kind::PointerArray => out.push(Item::Pointers {
-                eff: fpos,
-                fpos,
-                children: object.child_ids(&field.name),
-            }),
-            Kind::OffsetPointer => out.push(Item::OffsetPointer {
-                eff: fpos,
-                fpos,
-                children: object.child_ids(&field.name),
-            }),
-            Kind::Opaque => {}
+            FieldKind::Opaque => {
+                if let Some(&child) = object.child_ids(&field.name).first() {
+                    if let Ok(ci) = ctx.get(child) {
+                        inline_write(st, ctx, ci, fpos, out);
+                    }
+                }
+            }
         }
     }
 }
 
-/// Places an object at `off`: writes its inline data, then emits its
-/// out-of-line fields (strings and arrays) in descending field-offset order,
-/// recursing into referenced objects.
 fn place(st: &mut State, ctx: &Ctx, idx: usize, off: u32) -> Result<()> {
     let mut out = Vec::new();
     inline_write(st, ctx, idx, off, &mut out);
-    out.sort_by(|a, b| b.eff().cmp(&a.eff()));
 
-    for item in out {
+    while let Some(item) = {
+        out.sort_by(|a, b| a.eff().cmp(&b.eff()));
+        if ctx.reified {
+            (!out.is_empty()).then(|| out.remove(0))
+        } else {
+            out.pop()
+        }
+    } {
         match item {
             Item::Str { fpos, val, .. } => {
                 let at = st.next.max(st.len);
@@ -422,52 +512,57 @@ fn place(st: &mut State, ctx: &Ctx, idx: usize, off: u32) -> Result<()> {
             }
             Item::Array { fpos, children, .. } => {
                 if children.is_empty() {
-                    st.wi32(fpos, 0);
-                    st.wi32(fpos + 8, 0);
+                    write_empty_array(st, ctx, fpos);
                     continue;
                 }
                 let first = st.append(ctx.align_of(children[0]));
+                let mut at = first;
                 for &child in &children {
-                    let at = st.append(ctx.align_of(child));
-                    place(st, ctx, ctx.get(child)?, at)?;
+                    let ci = ctx.get(child)?;
+                    let size = ctx
+                        .registry
+                        .by_name(&ctx.objects[ci].type_name)
+                        .map(|t| t.size)
+                        .unwrap_or(8);
+                    inline_write(st, ctx, ci, at, &mut out);
+                    at += size;
                 }
                 st.wi32(fpos, first as i32 - fpos as i32);
                 st.wi32(fpos + 8, children.len() as i32);
             }
+            Item::RawArray { fpos, count, bytes, .. } => {
+                let at = st.append(8);
+                st.wbytes(at, &bytes);
+                st.wi32(fpos, at as i32 - fpos as i32);
+                st.wi32(fpos + 8, count as i32);
+            }
             Item::Pointers { fpos, children, .. } => {
                 if children.is_empty() {
-                    st.wi32(fpos, 0);
-                    st.wi32(fpos + 8, 0);
+                    write_empty_array(st, ctx, fpos);
                     continue;
                 }
-                // The editor keeps pointer-array targets in an unordered_map
-                // keyed by object id; their placement order is the bucket order
-                // (id % 8 for the default table), and the pointers themselves
-                // are written in reverse of that order.
-                let mut ordered = children.clone();
-                ordered.sort_by_key(|id| *id % 8);
+                // Pointer slot j references the j-th `<DataValue>` child; the
+                // targets themselves are placed in reverse slot order.
                 let block = st.append(8);
-                st.next = block + ordered.len() as u32 * 8;
+                st.next = block + children.len() as u32 * 8;
                 st.ensure(st.next);
-                let mut targets = Vec::with_capacity(ordered.len());
-                for &child in &ordered {
-                    let at = st.append(ctx.align_of(child));
-                    targets.push(at);
-                    place(st, ctx, ctx.get(child)?, at)?;
+                let mut targets = vec![0u32; children.len()];
+                for k in (0..children.len()).rev() {
+                    let at = st.append(ctx.align_of(children[k]));
+                    targets[k] = at;
+                    place(st, ctx, ctx.get(children[k])?, at)?;
                 }
-                for j in 0..targets.len() {
-                    let k = targets.len() - 1 - j;
-                    let target_off = targets[k];
+                for (j, (&child, &target_off)) in children.iter().zip(&targets).enumerate() {
                     let ptr = block + j as u32 * 8;
                     st.wi64(ptr, target_off as i64 - ptr as i64);
                     st.pointers.push(PtrRec {
                         file_off: RFCI_FILE_OFFSET + ptr,
-                        target: ctx.get(ordered[k])?,
+                        target: ctx.get(child)?,
                         target_off,
                     });
                 }
                 st.wi32(fpos, block as i32 - fpos as i32);
-                st.wi32(fpos + 8, ordered.len() as i32);
+                st.wi32(fpos + 8, children.len() as i32);
             }
             Item::OffsetPointer { fpos, children, .. } => {
                 let Some(&child) = children.first() else {
@@ -493,7 +588,13 @@ fn place_all(objects: &[RdoObject], registry: &SchemaRegistry) -> Result<(State,
         .iter()
         .position(|o| o.owner_id == 0)
         .ok_or_else(|| anyhow!("no root object (owner id 0) in .rdo"))?;
-    let ctx = Ctx { objects, by_id: &by_id, registry };
+    let reified = objects.iter().any(|o| {
+        matches!(
+            classify(&o.type_name, registry),
+            FieldKind::Str | FieldKind::Array | FieldKind::PointerArray
+        )
+    });
+    let ctx = Ctx { objects, by_id: &by_id, registry, reified };
     let root_size = registry
         .by_name(&objects[root].type_name)
         .ok_or_else(|| anyhow!("root type not in registry: {}", objects[root].type_name))?

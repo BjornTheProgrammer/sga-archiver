@@ -1,12 +1,14 @@
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use binrw::BinRead;
 
 use crate::container::Chunky;
 use crate::records::{InternedStringTable, ObjectTable};
-use crate::reflect_type::{parse_type, FieldDef, TypeDef};
+use crate::reflect_type::{
+    array_element_type, classify_field, is_enum_type, parse_type, FieldDef, FieldKind, TypeDef,
+};
 
 fn u32_at(b: &[u8], off: usize) -> Option<u32> {
     b.get(off..off + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
@@ -16,6 +18,9 @@ fn i32_at(b: &[u8], off: usize) -> Option<i32> {
 }
 fn u64_at(b: &[u8], off: usize) -> Option<u64> {
     b.get(off..off + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+}
+fn i64_at(b: &[u8], off: usize) -> Option<i64> {
+    u64_at(b, off).map(|v| v as i64)
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +63,21 @@ fn parse_interned(bytes: &[u8]) -> HashMap<u64, String> {
         .unwrap_or_default()
 }
 
+struct Emit<'a> {
+    by_offset: HashMap<usize, Vec<&'a ObjectRef>>,
+    emitted: HashSet<u64>,
+}
+
+impl<'a> Emit<'a> {
+    fn child_at(&self, file_pos: usize, owner: u64) -> Option<&'a ObjectRef> {
+        self.by_offset
+            .get(&file_pos)?
+            .iter()
+            .copied()
+            .find(|o| o.owner_id == owner)
+    }
+}
+
 impl DecompiledReflect {
     pub fn parse(chunky: &Chunky) -> Option<DecompiledReflect> {
         let mut out = DecompiledReflect::default();
@@ -90,17 +110,6 @@ impl DecompiledReflect {
         }
 
         if saw_type { Some(out) } else { None }
-    }
-
-    fn scalar(&self, pos: usize, type_name: &str) -> Option<(&'static str, String)> {
-        match type_name {
-            "bool" => Some(("Bool", (*self.data.get(pos)? != 0).to_string())),
-            "int32_t" => Some(("Int32", i32_at(&self.data, pos)?.to_string())),
-            "uint32_t" => Some(("UInt32", u32_at(&self.data, pos)?.to_string())),
-            "int64_t" => Some(("Int64", (u64_at(&self.data, pos)? as i64).to_string())),
-            "uint64_t" => Some(("UInt64", u64_at(&self.data, pos)?.to_string())),
-            _ => None,
-        }
     }
 
     fn read_string(&self, pos: usize) -> String {
@@ -136,33 +145,47 @@ impl DecompiledReflect {
         obj.data_offset.saturating_sub(self.rfci_offset)
     }
 
+    fn has_fields(&self, type_name: &str) -> bool {
+        self.types.values().any(|t| t.name == type_name && !t.fields.is_empty())
+    }
+
     pub fn to_rdo_xml(&self) -> String {
         let mut out = String::from("<DataWarehouse>\r\n");
+        let mut by_offset: HashMap<usize, Vec<&ObjectRef>> = HashMap::new();
+        for o in &self.objects {
+            by_offset.entry(o.data_offset).or_default().push(o);
+        }
+        let mut emit = Emit { by_offset, emitted: HashSet::new() };
         if let Some(root) = self.objects.iter().find(|o| o.id == self.root_id) {
             if let Some(ty) = self.types.get(&root.type_hash) {
                 out.push_str(&format!("\t<!--{}/-->\r\n", ty.name));
-                self.emit_object(root, 1, out.len(), &mut out);
+                self.emit_object(root, 1, &mut emit, &mut out);
             }
         }
         out.push_str("</DataWarehouse>\r\n");
         out
     }
 
-    fn emit_object(&self, obj: &ObjectRef, depth: usize, _pos: usize, out: &mut String) {
+    fn emit_object(&self, obj: &ObjectRef, depth: usize, emit: &mut Emit, out: &mut String) {
         let Some(ty) = self.types.get(&obj.type_hash) else {
             return;
         };
-        let base = self.base_of(obj);
+        if !emit.emitted.insert(obj.id) {
+            return;
+        }
         let tab = "\t".repeat(depth);
         if obj.owner_id == 0 {
             out.push_str(&format!(
                 "{tab}<DataObject Name=\"\" Type=\"{}\" Id=\"{}\">\r\n",
-                ty.name, obj.id
+                xml_escape(&ty.name),
+                obj.id
             ));
         } else {
             out.push_str(&format!(
                 "{tab}<DataObject Name=\"\" Type=\"{}\" Id=\"{}\" OwnerId=\"{}\">\r\n",
-                ty.name, obj.id, obj.owner_id
+                xml_escape(&ty.name),
+                obj.id,
+                obj.owner_id
             ));
         }
 
@@ -176,90 +199,270 @@ impl DecompiledReflect {
             }
         }
 
-        let mut used = vec![false; self.objects.len()];
-        for field in &ty.fields {
-            self.emit_property(obj, base, field, depth + 1, &mut used, out);
-        }
+        self.emit_object_content(obj, ty, depth + 1, emit, out);
 
         out.push_str(&format!("{tab}</DataObject>\r\n"));
+    }
+
+    fn emit_object_content(
+        &self,
+        obj: &ObjectRef,
+        ty: &TypeDef,
+        depth: usize,
+        emit: &mut Emit,
+        out: &mut String,
+    ) {
+        let tab = "\t".repeat(depth);
+        let base = self.base_of(obj);
+
+        if is_enum_type(&ty.name) {
+            let hash = u64_at(&self.data, base).unwrap_or(0);
+            match self.interned.get(&hash) {
+                Some(value) => out.push_str(&format!(
+                    "{tab}<DataProperty Name=\"m_enumName\" Type=\"String\" Value=\"{}\"/>\r\n",
+                    xml_escape(value)
+                )),
+                None => out.push_str(&format!(
+                    "{tab}<DataProperty Name=\"m_hashValue\" Type=\"UInt64\" Value=\"{hash}\"/>\r\n",
+                )),
+            }
+            return;
+        }
+
+        match classify_field(&ty.name, |n| self.has_fields(n)) {
+            FieldKind::Str => {
+                out.push_str(&format!(
+                    "{tab}<DataProperty Name=\"m_value\" Type=\"String\" Value=\"{}\"/>\r\n",
+                    xml_escape(&self.read_string(base))
+                ));
+            }
+            FieldKind::Array => {
+                let rel = i32_at(&self.data, base).unwrap_or(0);
+                let count = i32_at(&self.data, base + 8).unwrap_or(0).max(0) as usize;
+                match self.array_elements(obj, obj.data_offset, rel, count, emit) {
+                    Some(children) if !children.is_empty() => {
+                        self.emit_object_property("m_elements", &children, depth, emit, out)
+                    }
+                    Some(_) => {}
+                    None => {
+                        if let Some(bytes) = self.raw_array_bytes(&ty.name, base, rel, count) {
+                            out.push_str(&format!(
+                                "{tab}<DataProperty Name=\"m_elements\" Type=\"Bytes\" Count=\"{count}\" Value=\"{}\"/>\r\n",
+                                hex_encode(&bytes)
+                            ));
+                        }
+                    }
+                }
+            }
+            FieldKind::PointerArray => {
+                let rel = i32_at(&self.data, base).unwrap_or(0);
+                let count = i32_at(&self.data, base + 8).unwrap_or(0).max(0) as usize;
+                if let Some(children) = self.pointer_targets(base, rel, count, obj.id, emit) {
+                    if !children.is_empty() {
+                        self.emit_object_property("m_elements", &children, depth, emit, out);
+                    }
+                }
+            }
+            FieldKind::Opaque if ty.fields.is_empty() && ty.size > 0 => {
+                let size = ty.size as usize;
+                let bytes = self.data.get(base..base + size).unwrap_or_default();
+                out.push_str(&format!(
+                    "{tab}<DataProperty Name=\"#Raw\" Type=\"Bytes\" Count=\"{size}\" Value=\"{}\"/>\r\n",
+                    hex_encode(bytes)
+                ));
+            }
+            _ => {
+                for field in &ty.fields {
+                    self.emit_property(obj, field, depth, emit, out);
+                }
+            }
+        }
     }
 
     fn emit_property(
         &self,
         parent: &ObjectRef,
-        base: usize,
         field: &FieldDef,
         depth: usize,
-        used: &mut [bool],
+        emit: &mut Emit,
         out: &mut String,
     ) {
         let tab = "\t".repeat(depth);
-        let pos = base + field.offset as usize;
+        let pos = self.base_of(parent) + field.offset as usize;
+        let file_pos = parent.data_offset + field.offset as usize;
         let t = field.type_name.as_str();
-
-        if let Some((xml_type, value)) = self.scalar(pos, t) {
-            out.push_str(&format!(
-                "{tab}<DataProperty Name=\"{}\" Type=\"{xml_type}\" Value=\"{}\"/>\r\n",
-                field.name,
-                xml_escape(&value)
-            ));
-            return;
-        }
-
-        if t.starts_with("util::ReflectString") {
-            let s = self.read_string(pos);
-            out.push_str(&format!(
-                "{tab}<DataProperty Name=\"{}\" Type=\"String\" Value=\"{}\"/>\r\n",
-                field.name,
-                xml_escape(&s)
-            ));
-            return;
-        }
-
-        if t.starts_with("FamilyManagerEnum") || t.contains("ReflectStringHash") {
-            let hash = u64_at(&self.data, pos).unwrap_or(0);
-            let value = self.interned.get(&hash).cloned().unwrap_or_default();
-            out.push_str(&format!(
-                "{tab}<DataProperty Name=\"{}\" Type=\"String\" Value=\"{}\"/>\r\n",
-                field.name,
-                xml_escape(&value)
-            ));
-            return;
-        }
-
-        if t.starts_with("util::ReflectArray") {
-            let count = i32_at(&self.data, pos + 8).unwrap_or(0).max(0) as usize;
-            let elem = array_element_type(t);
-            let polymorphic = t.contains('*');
-            let children = self.take_children(parent.id, &elem, count, polymorphic, used);
-            if children.is_empty() {
-                out.push_str(&format!(
-                    "{tab}<DataProperty Name=\"{}\" Type=\"Object\"/>\r\n",
-                    field.name
-                ));
-            } else {
-                self.emit_object_property(&field.name, &children, depth, out);
-            }
-            return;
-        }
-
-        if let Some((idx, child)) = self.find_child(parent.id, t, used) {
-            used[idx] = true;
-            let child = child.clone();
-            self.emit_object_property(&field.name, &[child], depth, out);
-        } else {
+        let empty = |out: &mut String| {
             out.push_str(&format!(
                 "{tab}<DataProperty Name=\"{}\" Type=\"Object\"/>\r\n",
                 field.name
             ));
+        };
+
+        match classify_field(t, |n| self.has_fields(n)) {
+            FieldKind::Scalar => {
+                let (xml_type, value) = if t == "float" {
+                    ("Float", f32::from_bits(u32_at(&self.data, pos).unwrap_or(0)).to_string())
+                } else if t.contains("uint32") || t == "unsigned int" {
+                    ("UInt32", u32_at(&self.data, pos).unwrap_or(0).to_string())
+                } else {
+                    ("Int32", i32_at(&self.data, pos).unwrap_or(0).to_string())
+                };
+                out.push_str(&format!(
+                    "{tab}<DataProperty Name=\"{}\" Type=\"{xml_type}\" Value=\"{value}\"/>\r\n",
+                    field.name
+                ));
+            }
+            FieldKind::Scalar64 => {
+                let raw = u64_at(&self.data, pos).unwrap_or(0);
+                let (xml_type, value) = if t.contains("uint64") || t.starts_with("unsigned") {
+                    ("UInt64", raw.to_string())
+                } else {
+                    ("Int64", (raw as i64).to_string())
+                };
+                out.push_str(&format!(
+                    "{tab}<DataProperty Name=\"{}\" Type=\"{xml_type}\" Value=\"{value}\"/>\r\n",
+                    field.name
+                ));
+            }
+            FieldKind::Scalar8 => {
+                let value = self.data.get(pos).copied().unwrap_or(0);
+                out.push_str(&format!(
+                    "{tab}<DataProperty Name=\"{}\" Type=\"UInt8\" Value=\"{value}\"/>\r\n",
+                    field.name
+                ));
+            }
+            FieldKind::Bool => {
+                let value = self.data.get(pos).copied().unwrap_or(0) != 0;
+                out.push_str(&format!(
+                    "{tab}<DataProperty Name=\"{}\" Type=\"Bool\" Value=\"{value}\"/>\r\n",
+                    field.name
+                ));
+            }
+            FieldKind::Str => {
+                match emit.child_at(file_pos, parent.id) {
+                    Some(child) => {
+                        self.emit_object_property(&field.name, &[child], depth, emit, out)
+                    }
+                    None => out.push_str(&format!(
+                        "{tab}<DataProperty Name=\"{}\" Type=\"String\" Value=\"{}\"/>\r\n",
+                        field.name,
+                        xml_escape(&self.read_string(pos))
+                    )),
+                }
+            }
+            FieldKind::Embed | FieldKind::Enum => match emit.child_at(file_pos, parent.id) {
+                Some(child) => self.emit_object_property(&field.name, &[child], depth, emit, out),
+                None => empty(out),
+            },
+            FieldKind::OffsetPointer => {
+                let rel = i32_at(&self.data, pos).unwrap_or(0);
+                let target = (file_pos as i64 + rel as i64) as usize;
+                match (rel != 0).then(|| emit.child_at(target, parent.id)).flatten() {
+                    Some(child) => {
+                        self.emit_object_property(&field.name, &[child], depth, emit, out)
+                    }
+                    None => empty(out),
+                }
+            }
+            FieldKind::Array | FieldKind::PointerArray => {
+                if let Some(child) = emit.child_at(file_pos, parent.id) {
+                    self.emit_object_property(&field.name, &[child], depth, emit, out);
+                    return;
+                }
+                let rel = i32_at(&self.data, pos).unwrap_or(0);
+                let count = i32_at(&self.data, pos + 8).unwrap_or(0).max(0) as usize;
+                if classify_field(t, |n| self.has_fields(n)) == FieldKind::PointerArray {
+                    match self.pointer_targets(pos, rel, count, parent.id, emit) {
+                        Some(children) if !children.is_empty() => {
+                            self.emit_object_property(&field.name, &children, depth, emit, out)
+                        }
+                        _ => empty(out),
+                    }
+                    return;
+                }
+                match self.array_elements(parent, file_pos, rel, count, emit) {
+                    Some(children) if !children.is_empty() => {
+                        self.emit_object_property(&field.name, &children, depth, emit, out)
+                    }
+                    Some(_) => empty(out),
+                    None => match self.raw_array_bytes(t, pos, rel, count) {
+                        Some(bytes) => out.push_str(&format!(
+                            "{tab}<DataProperty Name=\"{}\" Type=\"Bytes\" Count=\"{count}\" Value=\"{}\"/>\r\n",
+                            field.name,
+                            hex_encode(&bytes)
+                        )),
+                        None => empty(out),
+                    },
+                }
+            }
+            FieldKind::Opaque => match emit.child_at(file_pos, parent.id) {
+                Some(child) => self.emit_object_property(&field.name, &[child], depth, emit, out),
+                None => empty(out),
+            },
         }
+    }
+
+    fn array_elements<'a>(
+        &'a self,
+        parent: &ObjectRef,
+        file_pos: usize,
+        rel: i32,
+        count: usize,
+        emit: &Emit<'a>,
+    ) -> Option<Vec<&'a ObjectRef>> {
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let first = (file_pos as i64 + rel as i64) as usize;
+        emit.child_at(first, parent.id)?;
+        let mut elems: Vec<&ObjectRef> = self
+            .objects
+            .iter()
+            .filter(|o| o.owner_id == parent.id && o.data_offset >= first)
+            .collect();
+        elems.sort_by_key(|o| o.data_offset);
+        elems.truncate(count);
+        (elems.len() == count && elems[0].data_offset == first).then_some(elems)
+    }
+
+    fn raw_array_bytes(&self, array_type: &str, pos: usize, rel: i32, count: usize) -> Option<Vec<u8>> {
+        if count == 0 {
+            return None;
+        }
+        let elem = array_element_type(array_type);
+        let size = self.types.values().find(|t| t.name == elem)?.size as usize;
+        let start = (pos as i64 + rel as i64) as usize;
+        self.data.get(start..start + count * size).map(|b| b.to_vec())
+    }
+
+    fn pointer_targets<'a>(
+        &self,
+        pos: usize,
+        rel: i32,
+        count: usize,
+        owner: u64,
+        emit: &Emit<'a>,
+    ) -> Option<Vec<&'a ObjectRef>> {
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let block = (pos as i64 + rel as i64) as usize;
+        let mut targets = Vec::with_capacity(count);
+        for j in 0..count {
+            let ptr = block + j * 8;
+            let rel2 = i64_at(&self.data, ptr)?;
+            let target = (ptr as i64 + rel2) as usize + self.rfci_offset;
+            targets.push(emit.child_at(target, owner)?);
+        }
+        Some(targets)
     }
 
     fn emit_object_property(
         &self,
         field_name: &str,
-        children: &[ObjectRef],
+        children: &[&ObjectRef],
         depth: usize,
+        emit: &mut Emit,
         out: &mut String,
     ) {
         let tab = "\t".repeat(depth);
@@ -274,63 +477,16 @@ impl DecompiledReflect {
                 .map(|t| t.name.as_str())
                 .unwrap_or("");
             out.push_str(&format!(
-                "{ctab}<DataValue Name=\"{type_name}\">{}</DataValue>\r\n",
+                "{ctab}<DataValue Name=\"{}\">{}</DataValue>\r\n",
+                xml_escape(type_name),
                 child.id
             ));
         }
         for child in children {
-            self.emit_object(child, depth + 1, 0, out);
+            self.emit_object(child, depth + 1, emit, out);
         }
         out.push_str(&format!("{tab}</DataProperty>\r\n"));
     }
-
-    fn take_children(
-        &self,
-        owner_id: u64,
-        type_name: &str,
-        count: usize,
-        polymorphic: bool,
-        used: &mut [bool],
-    ) -> Vec<ObjectRef> {
-        let mut out = Vec::new();
-        for (i, o) in self.objects.iter().enumerate() {
-            if out.len() >= count {
-                break;
-            }
-            let type_ok = polymorphic
-                || self.types.get(&o.type_hash).is_some_and(|t| t.name == type_name);
-            if !used[i] && o.owner_id == owner_id && type_ok {
-                used[i] = true;
-                out.push(o.clone());
-            }
-        }
-        out
-    }
-
-    fn find_child(
-        &self,
-        owner_id: u64,
-        type_name: &str,
-        used: &[bool],
-    ) -> Option<(usize, &ObjectRef)> {
-        self.objects.iter().enumerate().find(|(i, o)| {
-            !used[*i]
-                && o.owner_id == owner_id
-                && self
-                    .types
-                    .get(&o.type_hash)
-                    .is_some_and(|t| t.name == type_name)
-        })
-    }
-}
-
-fn array_element_type(array_type: &str) -> String {
-    let inner = array_type
-        .strip_prefix("util::ReflectArray<")
-        .and_then(|s| s.strip_suffix('>'))
-        .unwrap_or(array_type);
-    let elem = inner.strip_suffix(",StdTraits").unwrap_or(inner);
-    elem.trim().trim_end_matches('*').trim().to_string()
 }
 
 fn xml_escape(s: &str) -> String {
@@ -338,4 +494,8 @@ fn xml_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

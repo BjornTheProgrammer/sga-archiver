@@ -46,7 +46,7 @@ pub fn read_field(input: TokenStream) -> TokenStream {
     let generated = if output_type == "u8" {
         quote! {{
             use byteorder::{LittleEndian, BigEndian, ReadBytesExt};
-    
+
             #reader.#method().map_err(|_| {
                 #enum_name::#variant("Failed to parse version number".to_string())
             })
@@ -54,7 +54,7 @@ pub fn read_field(input: TokenStream) -> TokenStream {
     } else {
         quote! {{
             use byteorder::{LittleEndian, BigEndian, ReadBytesExt};
-    
+
             #reader.#method::<LittleEndian>().map_err(|_| {
                 #enum_name::#variant("Failed to parse version number".to_string())
             })

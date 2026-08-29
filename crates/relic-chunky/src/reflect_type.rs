@@ -29,6 +29,81 @@ pub struct TypeDef {
     pub bases: Vec<(u64, u32)>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldKind {
+    /// 4-byte value written inline (float / int32 / uint32).
+    Scalar,
+    /// 8-byte value written inline (int64 / uint64).
+    Scalar64,
+    /// 1-byte value written inline (char / uint8).
+    Scalar8,
+    /// 1-byte flag written inline.
+    Bool,
+    /// Out-of-line string: `[i32 rel][pad][i32 len]` inline.
+    Str,
+    /// Interned enum: `u64` string hash written inline, child object in `.rdo`.
+    Enum,
+    /// Struct child written inside the parent's footprint at the field offset.
+    Embed,
+    /// `[i32 rel]` inline pointing at an out-of-line child.
+    OffsetPointer,
+    /// By-value array: `[i32 rel][pad][i32 count]`, elements packed out-of-line.
+    Array,
+    /// Pointer array: `[i32 rel][pad][i32 count]` to a block of 8-byte
+    /// relative pointers, one per out-of-line element.
+    PointerArray,
+    /// Not written; occupies its footprint as zeros.
+    Opaque,
+}
+
+pub fn is_enum_type(type_name: &str) -> bool {
+    type_name.contains("FamilyManagerEnum") || type_name.contains("ReflectStringHash")
+}
+
+pub fn classify_field(type_name: &str, has_fields: impl Fn(&str) -> bool) -> FieldKind {
+    if type_name.contains("ReflectArray") {
+        if type_name.contains('*') {
+            FieldKind::PointerArray
+        } else {
+            FieldKind::Array
+        }
+    } else if is_enum_type(type_name) {
+        FieldKind::Enum
+    } else if type_name.contains("ReflectString") {
+        FieldKind::Str
+    } else if type_name.contains("ReflectOffsetPointer") {
+        FieldKind::OffsetPointer
+    } else if type_name == "bool" {
+        FieldKind::Bool
+    } else if type_name == "float"
+        || type_name.contains("int32")
+        || type_name == "int"
+        || type_name == "unsigned int"
+    {
+        FieldKind::Scalar
+    } else if type_name.contains("int64")
+        || type_name == "long long"
+        || type_name == "unsigned long long"
+    {
+        FieldKind::Scalar64
+    } else if type_name == "char" || type_name == "uint8_t" || type_name == "unsigned char" {
+        FieldKind::Scalar8
+    } else if has_fields(type_name) {
+        FieldKind::Embed
+    } else {
+        FieldKind::Opaque
+    }
+}
+
+pub fn array_element_type(array_type: &str) -> String {
+    let inner = array_type
+        .strip_prefix("util::ReflectArray<")
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(array_type);
+    let elem = inner.strip_suffix(",StdTraits").unwrap_or(inner);
+    elem.trim().trim_end_matches('*').trim().to_string()
+}
+
 /// A forward-only cursor over a chunk payload. Every read advances the
 /// position, so the layout of a chunk is expressed as a sequence of reads
 /// rather than absolute offset arithmetic.

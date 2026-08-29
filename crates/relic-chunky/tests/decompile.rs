@@ -4,6 +4,8 @@ use std::io::Cursor;
 use relic_chunky::{container::Chunky, decompile::DecompiledReflect, reflect_write::recompile_bin};
 
 const MOD_BIN: &[u8] = include_bytes!("mod.bin");
+const CORRUPTION_BIN: &[u8] = include_bytes!("fixtures/winconditions/corruption.bin");
+const ART_BIN: &[u8] = include_bytes!("fixtures/art/chi_barracks_control_age01.bin");
 
 /// Read/write drift guard for reflection: decompiling a `.bin` to `.rdo` and
 /// recompiling it must reproduce the original bytes. This is the exact path the
@@ -11,10 +13,33 @@ const MOD_BIN: &[u8] = include_bytes!("mod.bin");
 /// `reflect_write` are exact inverses for it.
 #[test]
 fn reflection_bin_round_trips_byte_exact() {
-    let chunky = Chunky::read(&mut Cursor::new(MOD_BIN)).unwrap();
-    let decompiled = DecompiledReflect::parse(&chunky).unwrap();
-    let rebuilt = recompile_bin(&decompiled.to_rdo_xml(), MOD_BIN).unwrap();
-    assert_eq!(rebuilt, MOD_BIN, "decompile→recompile was not byte-exact");
+    let cases = [
+        ("mod.bin", MOD_BIN),
+        ("corruption.bin", CORRUPTION_BIN),
+        ("chi_barracks_control_age01.bin", ART_BIN),
+    ];
+    for (name, bin) in cases {
+        let chunky = Chunky::read(&mut Cursor::new(bin)).unwrap();
+        let decompiled = DecompiledReflect::parse(&chunky).unwrap();
+        let rebuilt = recompile_bin(&decompiled.to_rdo_xml(), bin).unwrap();
+        assert_eq!(rebuilt, bin, "{name}: decompile→recompile was not byte-exact");
+    }
+}
+
+#[test]
+fn decompile_emits_every_object() {
+    for bin in [CORRUPTION_BIN, ART_BIN] {
+        let chunky = Chunky::read(&mut Cursor::new(bin)).unwrap();
+        let decompiled = DecompiledReflect::parse(&chunky).unwrap();
+        let xml = decompiled.to_rdo_xml();
+        for object in &decompiled.objects {
+            assert!(
+                xml.contains(&format!("Id=\"{}\"", object.id)),
+                "object {} missing from decompiled .rdo",
+                object.id
+            );
+        }
+    }
 }
 
 fn decompile(bytes: &'static [u8]) -> DecompiledReflect {
