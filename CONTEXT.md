@@ -23,7 +23,7 @@ commits, and design discussions.
   TOCs → Archive, driven by the `.burnproj` rules.
 - **Burner** — one source-to-asset compiler named by the burnproj:
   ReflectBurner (`.rdo`→`.bin`), RRTextureBurner (`.png`→`.rrtex`),
-  UCS (`.csv`→`.ucs`).
+  Mod Attributes (`attrib\*.xml`→`.rgd`), UCS (`.csv`→`.ucs`).
 
 ## Relic Chunky formats (`crates/relic-chunky`)
 
