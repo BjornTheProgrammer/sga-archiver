@@ -9,7 +9,6 @@ use clap::{Parser, Subcommand};
 use relic_chunky::{
     container::Chunky,
     decompile::DecompiledReflect,
-    reflect::ReflectFile,
     rgd::{RelicGameData, game_data_to_xml},
 };
 use sga::{extract_all, read_header};
@@ -116,8 +115,6 @@ fn format_guid(raw: &str) -> String {
     }
 }
 
-/// Decompiles extracted reflection files (`.bin`/`.rdo`) to a `.txt` report and
-/// a `.rdo` source alongside each.
 fn decode_reflect_files(written_files: &[PathBuf]) {
     let mut decompiled = 0;
     for path in written_files.iter().filter(|p| {
@@ -131,7 +128,7 @@ fn decode_reflect_files(written_files: &[PathBuf]) {
         }
     }
     if decompiled > 0 {
-        println!("Decompiled {decompiled} reflection file(s) to txt");
+        println!("Decompiled {decompiled} reflection file(s) to rdo");
     }
 }
 
@@ -142,12 +139,9 @@ fn decode_reflect_file(path: &Path) -> Result<bool> {
         Err(_) => return Ok(false),
     };
 
-    match ReflectFile::parse(&chunky) {
-        Some(reflect) => {
-            fs::write(path.with_extension("txt"), reflect.to_report())?;
-            if let Some(decompiled) = DecompiledReflect::parse(&chunky) {
-                fs::write(path.with_extension("rdo"), decompiled.to_rdo_xml())?;
-            }
+    match DecompiledReflect::parse(&chunky) {
+        Some(decompiled) => {
+            fs::write(path.with_extension("rdo"), decompiled.to_rdo_xml())?;
             Ok(true)
         }
         None => Ok(false),
