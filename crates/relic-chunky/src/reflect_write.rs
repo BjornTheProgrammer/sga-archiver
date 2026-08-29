@@ -4,11 +4,10 @@ use std::io::Cursor;
 use anyhow::{anyhow, bail, Result};
 use binrw::BinWrite;
 use byteorder::{LittleEndian, WriteBytesExt};
-use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
 
 use crate::container::{Chunk, ChunkBody, ChunkKind, Chunky};
 use crate::records::{HashedString, InternedStringTable, ObjectRecord, ObjectTable};
+use crate::rdo::{parse_rdo, RdoObject};
 use crate::reflect_type::{classify_field, is_enum_type, FieldKind, SchemaRegistry};
 
 /// The reflection data blob (`RFCI`) is the first chunk, so its bytes begin
@@ -16,165 +15,6 @@ use crate::reflect_type::{classify_field, is_enum_type, FieldKind, SchemaRegistr
 const RFCI_FILE_OFFSET: u32 = 44;
 /// The blob opens with a reserved word before the root object's data.
 const RFCI_PREFIX: u32 = 4;
-
-// ---------------------------------------------------------------------------
-// `.rdo` object graph
-// ---------------------------------------------------------------------------
-
-/// One `<DataObject>` from the `.rdo`, with its scalar/bool/string fields keyed
-/// by field name and its object-valued fields kept as ordered `(field, id)`
-#[derive(Debug, Default)]
-struct RdoObject {
-    id: u64,
-    type_name: String,
-    owner_id: u64,
-    scalars: HashMap<String, u64>,
-    bools: HashMap<String, bool>,
-    strings: HashMap<String, String>,
-    raws: HashMap<String, (u32, Vec<u8>)>,
-    children: Vec<(String, u64)>,
-}
-
-impl RdoObject {
-    fn child_ids(&self, field: &str) -> Vec<u64> {
-        self.children
-            .iter()
-            .filter(|(name, _)| name == field)
-            .map(|(_, id)| *id)
-            .collect()
-    }
-}
-
-/// Resolves the XML entities that appear in `.rdo` attribute values (notably
-/// `&lt;`/`&gt;` in template type names) so names match the schema.
-fn unescape(raw: &str) -> String {
-    raw.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
-fn hex_decode(s: &str) -> Vec<u8> {
-    s.as_bytes()
-        .chunks(2)
-        .filter_map(|pair| {
-            let hi = (*pair.first()? as char).to_digit(16)?;
-            let lo = (*pair.get(1)? as char).to_digit(16)?;
-            Some((hi * 16 + lo) as u8)
-        })
-        .collect()
-}
-
-fn attr(tag: &BytesStart, name: &str) -> Option<String> {
-    tag.attributes().flatten().find_map(|a| {
-        if a.key.as_ref() == name.as_bytes() {
-            Some(unescape(&String::from_utf8_lossy(&a.value)))
-        } else {
-            None
-        }
-    })
-}
-
-/// Stores a leaf `<DataProperty>` on `object` according to its declared type.
-fn store_scalar(object: &mut RdoObject, prop_type: &str, name: String, value: &str) {
-    match prop_type {
-        "Bool" => {
-            object.bools.insert(name, value.eq_ignore_ascii_case("true"));
-        }
-        "String" => {
-            object.strings.insert(name, value.to_string());
-        }
-        "Float" => {
-            object.scalars.insert(name, value.parse::<f32>().unwrap_or(0.0).to_bits() as u64);
-        }
-        "Int32" => {
-            object.scalars.insert(name, value.parse::<i32>().unwrap_or(0) as u32 as u64);
-        }
-        "Int64" => {
-            object.scalars.insert(name, value.parse::<i64>().unwrap_or(0) as u64);
-        }
-        _ => {
-            object.scalars.insert(name, value.parse::<u64>().unwrap_or(0));
-        }
-    }
-}
-
-fn parse_rdo(xml: &str) -> Result<Vec<RdoObject>> {
-    let mut reader = Reader::from_str(xml);
-    let mut objects: Vec<RdoObject> = Vec::new();
-    let mut stack: Vec<usize> = Vec::new();
-    // Open object-valued properties: (owning object index, field name). A
-    let mut open_fields: Vec<(usize, String)> = Vec::new();
-    let mut in_data_value = false;
-
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(tag)) if tag.name().as_ref() == b"DataObject" => {
-                let id = attr(&tag, "Id").and_then(|s| s.parse().ok()).unwrap_or(0);
-                let idx = objects.len();
-                objects.push(RdoObject {
-                    id,
-                    type_name: attr(&tag, "Type").unwrap_or_default(),
-                    owner_id: attr(&tag, "OwnerId").and_then(|s| s.parse().ok()).unwrap_or(0),
-                    ..Default::default()
-                });
-                stack.push(idx);
-            }
-            Ok(Event::Start(tag)) if tag.name().as_ref() == b"DataValue" => {
-                in_data_value = true;
-            }
-            Ok(Event::Text(text)) if in_data_value => {
-                let raw = String::from_utf8_lossy(text.as_ref());
-                if let (Some((parent, field)), Ok(id)) =
-                    (open_fields.last(), raw.trim().parse::<u64>())
-                {
-                    objects[*parent].children.push((field.clone(), id));
-                }
-            }
-            Ok(Event::End(tag)) if tag.name().as_ref() == b"DataValue" => {
-                in_data_value = false;
-            }
-            Ok(Event::Start(tag)) if tag.name().as_ref() == b"DataProperty" => {
-                if attr(&tag, "Type").as_deref() == Some("Object") {
-                    if let (Some(&current), Some(field)) = (stack.last(), attr(&tag, "Name")) {
-                        open_fields.push((current, field));
-                    }
-                }
-            }
-            Ok(Event::Empty(tag)) if tag.name().as_ref() == b"DataProperty" => {
-                let prop_type = attr(&tag, "Type").unwrap_or_default();
-                // A self-closing object property is just an empty array; there
-                // is no value to store.
-                if prop_type == "Object" {
-                    continue;
-                }
-                if let (Some(&current), Some(name), Some(value)) =
-                    (stack.last(), attr(&tag, "Name"), attr(&tag, "Value"))
-                {
-                    if prop_type == "Bytes" {
-                        let count =
-                            attr(&tag, "Count").and_then(|s| s.parse().ok()).unwrap_or(0);
-                        objects[current].raws.insert(name, (count, hex_decode(&value)));
-                    } else {
-                        store_scalar(&mut objects[current], &prop_type, name, &value);
-                    }
-                }
-            }
-            Ok(Event::End(tag)) if tag.name().as_ref() == b"DataObject" => {
-                stack.pop();
-            }
-            Ok(Event::End(tag)) if tag.name().as_ref() == b"DataProperty" => {
-                open_fields.pop();
-            }
-            Ok(Event::Eof) => break,
-            Err(err) => bail!("failed to parse .rdo xml: {err}"),
-            _ => {}
-        }
-    }
-
-    Ok(objects)
-}
 
 // ---------------------------------------------------------------------------
 // Field classification and alignment
@@ -362,10 +202,10 @@ fn inline_write(st: &mut State, ctx: &Ctx, idx: usize, off: u32, out: &mut Vec<I
     st.ensure(off + size);
 
     if is_enum_type(&object.type_name) {
-        if let Some(&hash) = object.scalars.get("m_hashValue") {
+        if let Some(hash) = object.scalar("m_hashValue") {
             st.w64(off, hash);
         } else {
-            let name = object.strings.get("m_enumName").cloned().unwrap_or_default();
+            let name = object.string("m_enumName").unwrap_or_default().to_string();
             let hash = city_hash64(name.to_lowercase().as_bytes());
             st.w64(off, hash);
             st.intern(hash, name);
@@ -378,19 +218,19 @@ fn inline_write(st: &mut State, ctx: &Ctx, idx: usize, off: u32, out: &mut Vec<I
             out.push(Item::Str {
                 eff: off,
                 fpos: off,
-                val: object.strings.get("m_value").cloned().unwrap_or_default(),
+                val: object.string("m_value").unwrap_or_default().to_string(),
             });
             return;
         }
         FieldKind::Array => {
             let children = object.child_ids("m_elements");
             if children.is_empty() {
-                if let Some((count, bytes)) = object.raws.get("m_elements") {
+                if let Some((count, bytes)) = object.raw("m_elements") {
                     out.push(Item::RawArray {
                         eff: off,
                         fpos: off,
-                        count: *count,
-                        bytes: bytes.clone(),
+                        count,
+                        bytes: bytes.to_vec(),
                     });
                     return;
                 }
@@ -403,7 +243,7 @@ fn inline_write(st: &mut State, ctx: &Ctx, idx: usize, off: u32, out: &mut Vec<I
             return;
         }
         FieldKind::Opaque => {
-            if let Some((_, bytes)) = object.raws.get("#Raw") {
+            if let Some((_, bytes)) = object.raw("#Raw") {
                 st.wbytes(off, bytes);
             }
             return;
@@ -419,23 +259,23 @@ fn inline_write(st: &mut State, ctx: &Ctx, idx: usize, off: u32, out: &mut Vec<I
         let fpos = off + field.offset;
         match classify(&field.type_name, ctx.registry) {
             FieldKind::Scalar => {
-                st.w32(fpos, object.scalars.get(&field.name).copied().unwrap_or(0) as u32)
+                st.w32(fpos, object.scalar(&field.name).unwrap_or(0) as u32)
             }
             FieldKind::Scalar64 => {
-                st.w64(fpos, object.scalars.get(&field.name).copied().unwrap_or(0))
+                st.w64(fpos, object.scalar(&field.name).unwrap_or(0))
             }
             FieldKind::Scalar8 => {
-                st.w8(fpos, object.scalars.get(&field.name).copied().unwrap_or(0) as u8)
+                st.w8(fpos, object.scalar(&field.name).unwrap_or(0) as u8)
             }
             FieldKind::Bool => {
-                st.w8(fpos, object.bools.get(&field.name).copied().unwrap_or(false) as u8)
+                st.w8(fpos, object.bool(&field.name).unwrap_or(false) as u8)
             }
             FieldKind::Str => match reified_child(ctx, object, &field.name) {
                 Some(ci) => inline_write(st, ctx, ci, fpos, out),
                 None => out.push(Item::Str {
                     eff: fpos,
                     fpos,
-                    val: object.strings.get(&field.name).cloned().unwrap_or_default(),
+                    val: object.string(&field.name).unwrap_or_default().to_string(),
                 }),
             },
             FieldKind::Embed | FieldKind::Enum => {
@@ -449,13 +289,13 @@ fn inline_write(st: &mut State, ctx: &Ctx, idx: usize, off: u32, out: &mut Vec<I
                 Some(ci) => inline_write(st, ctx, ci, fpos, out),
                 None => {
                     let children = object.child_ids(&field.name);
-                    match object.raws.get(&field.name) {
+                    match object.raw(&field.name) {
                         Some((count, bytes)) if children.is_empty() => {
                             out.push(Item::RawArray {
                                 eff: fpos,
                                 fpos,
-                                count: *count,
-                                bytes: bytes.clone(),
+                                count,
+                                bytes: bytes.to_vec(),
                             })
                         }
                         _ => out.push(Item::Array { eff: fpos, fpos, children }),
@@ -712,7 +552,7 @@ fn replace_chunk(chunks: &mut [Chunk], name: &[u8; 4], data: Vec<u8>) -> bool {
 /// rebuilding the object data (`RFCI`), object table (`ROBJ`) and, when the
 /// graph interns any values, the string-hash table (`RSHI`).
 pub fn compile_reflect(rdo_xml: &str, registry: &SchemaRegistry, reference: &Chunky) -> Result<Chunky> {
-    let objects = parse_rdo(rdo_xml)?;
+    let objects = parse_rdo(rdo_xml)?.objects;
     let (st, _root) = place_all(&objects, registry)?;
 
     let robj = build_robj(&st, &objects, registry)?;
@@ -763,7 +603,7 @@ pub fn compile_reflect_full(
     registry: &SchemaRegistry,
     schema: &Chunk,
 ) -> Result<Chunky> {
-    let objects = parse_rdo(rdo_xml)?;
+    let objects = parse_rdo(rdo_xml)?.objects;
     let (st, root) = place_all(&objects, registry)?;
 
     let robj = build_robj(&st, &objects, registry)?;
@@ -870,7 +710,7 @@ fn root_type_hash(robj: &[u8]) -> Result<u64> {
 
 /// The type of the root object (the one with owner id 0) declared in a `.rdo`.
 pub fn root_type_of(rdo_xml: &str) -> Result<String> {
-    let objects = parse_rdo(rdo_xml)?;
+    let objects = parse_rdo(rdo_xml)?.objects;
     objects
         .iter()
         .find(|o| o.owner_id == 0)

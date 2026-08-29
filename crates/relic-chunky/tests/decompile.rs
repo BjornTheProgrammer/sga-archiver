@@ -27,6 +27,18 @@ fn reflection_bin_round_trips_byte_exact() {
 }
 
 #[test]
+fn rdo_graph_survives_xml_round_trip() {
+    for bin in [MOD_BIN, CORRUPTION_BIN, ART_BIN] {
+        let chunky = Chunky::read(&mut Cursor::new(bin)).unwrap();
+        let mut graph = DecompiledReflect::parse(&chunky).unwrap().to_rdo_graph();
+        let mut reparsed = relic_chunky::rdo::parse_rdo(&graph.to_xml()).unwrap();
+        graph.objects.sort_by_key(|o| o.id);
+        reparsed.objects.sort_by_key(|o| o.id);
+        assert_eq!(reparsed, graph, "graph → xml → graph drifted");
+    }
+}
+
+#[test]
 fn decompile_emits_every_object() {
     for bin in [CORRUPTION_BIN, ART_BIN] {
         let chunky = Chunky::read(&mut Cursor::new(bin)).unwrap();
