@@ -1,5 +1,6 @@
 [package]
 name = "relic-chunky"
+description = "Read and write Relic Chunky formats: reflection .bin/.rdo, RGD game data, and rrtex textures"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
