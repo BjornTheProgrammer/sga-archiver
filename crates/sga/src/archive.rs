@@ -60,6 +60,57 @@ pub struct Folder {
     pub files: Vec<FileEntry>,
 }
 
+impl Folder {
+    /// Every file at or beneath this folder, paired with its full path.
+    ///
+    /// Paths are relative to this folder and joined with the archive's own
+    /// separator, the same form the TOC string blob stores. This folder's own
+    /// name is not part of them, matching the way a TOC treats its root.
+    ///
+    /// Order is depth-first: a folder's own files, then each subfolder in
+    /// turn.
+    pub fn files_recursive(&self) -> Vec<(String, &FileEntry)> {
+        fn collect<'a>(prefix: &str, folder: &'a Folder, out: &mut Vec<(String, &'a FileEntry)>) {
+            for file in &folder.files {
+                out.push((child_path(prefix, &file.name), file));
+            }
+            for child in &folder.folders {
+                collect(&child_path(prefix, &child.name), child, out);
+            }
+        }
+        let mut out = Vec::new();
+        collect("", self, &mut out);
+        out
+    }
+
+    /// The full path of every file at or beneath this folder.
+    ///
+    /// The paths [`Folder::files_recursive`] produces, without the entries.
+    pub fn file_paths(&self) -> Vec<String> {
+        self.files_recursive()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect()
+    }
+
+    /// How many files are at or beneath this folder, at any depth.
+    pub fn file_count(&self) -> usize {
+        self.files.len() + self.folders.iter().map(Folder::file_count).sum::<usize>()
+    }
+
+    /// How many folders are beneath this folder, at any depth.
+    ///
+    /// This folder is not counted; a leaf folder reports zero.
+    pub fn folder_count(&self) -> usize {
+        self.folders.len()
+            + self
+                .folders
+                .iter()
+                .map(Folder::folder_count)
+                .sum::<usize>()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub name: String,
