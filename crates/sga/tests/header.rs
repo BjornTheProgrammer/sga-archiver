@@ -1,7 +1,6 @@
-
 use std::io::{BufReader, Cursor};
 
-use sga::entires::{FileEncryptionType, HeaderReserved, SgaHeader};
+use sga::entries::{FileEncryptionType, HeaderReserved, SgaHeader};
 
 fn sample(version: u16) -> SgaHeader {
     let v = version;
@@ -34,8 +33,16 @@ fn sample(version: u16) -> SgaHeader {
         file_hash_length: if v >= 8 { 1420 } else { 0 },
         reserved: HeaderReserved {
             pre_name: if v < 6 { [0xAA; 16] } else { defaults.pre_name },
-            post_name: if v < 6 { [0xBB; 16] } else { defaults.post_name },
-            v5: if v == 5 { [0xC1C1, 0xC2C2] } else { defaults.v5 },
+            post_name: if v < 6 {
+                [0xBB; 16]
+            } else {
+                defaults.post_name
+            },
+            v5: if v == 5 {
+                [0xC1C1, 0xC2C2]
+            } else {
+                defaults.v5
+            },
             pad: if v < 11 { 0xD1D1 } else { defaults.pad },
             v11_one: defaults.v11_one,
         },
@@ -54,12 +61,19 @@ fn roundtrip(version: u16) {
     let bytes = out.into_inner();
 
     let parsed = SgaHeader::parse(&mut BufReader::new(Cursor::new(&bytes))).unwrap();
-    assert_eq!(parsed, header, "v{version}: parsed fields differ from written");
+    assert_eq!(
+        parsed, header,
+        "v{version}: parsed fields differ from written"
+    );
 
     let mut again = Cursor::new(Vec::new());
     parsed.write_main_header(&mut again).unwrap();
     parsed.write_index_table(&mut again).unwrap();
-    assert_eq!(again.into_inner(), bytes, "v{version}: write→read→write drifted");
+    assert_eq!(
+        again.into_inner(),
+        bytes,
+        "v{version}: write→read→write drifted"
+    );
 }
 
 #[test]
@@ -74,8 +88,16 @@ fn write_rejects_unsupported_versions() {
     for version in [0, 2, 12] {
         let mut header = sample(11);
         header.version = version;
-        assert!(header.write_main_header(&mut Cursor::new(Vec::new())).is_err());
-        assert!(header.write_index_table(&mut Cursor::new(Vec::new())).is_err());
+        assert!(
+            header
+                .write_main_header(&mut Cursor::new(Vec::new()))
+                .is_err()
+        );
+        assert!(
+            header
+                .write_index_table(&mut Cursor::new(Vec::new()))
+                .is_err()
+        );
     }
 }
 

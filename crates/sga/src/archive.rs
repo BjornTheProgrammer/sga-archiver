@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use binrw::{BinRead, BinWrite};
 use brotli::Decompressor;
 use flate2::read::DeflateDecoder;
@@ -10,10 +10,9 @@ use flate2::write::ZlibEncoder;
 use flate2::{Compression, Crc};
 use sha1::{Digest, Sha1};
 
-use crate::entires::{
-    HeaderReserved,
-    FileEncryptionType, FileStorageType, FileVerificationType, SgaFileEntry, SgaFolderEntry,
-    SgaHeader, SgaToC,
+use crate::entries::{
+    FileEncryptionType, FileStorageType, FileVerificationType, HeaderReserved, SgaFileEntry,
+    SgaFolderEntry, SgaHeader, SgaToC,
 };
 
 const MAIN_HEADER_SIZE: u64 = 428;
@@ -118,7 +117,10 @@ impl<'a> Iterator for Files<'a> {
             for child in folder.folders.iter().rev() {
                 self.pending.push((child_path(&prefix, &child.name), child));
             }
-            self.current = self.pending.pop().map(|(prefix, folder)| (prefix, folder, 0));
+            self.current = self
+                .pending
+                .pop()
+                .map(|(prefix, folder)| (prefix, folder, 0));
         }
     }
 }
@@ -239,7 +241,13 @@ impl Archive {
             .into_iter()
             .find(|&layout| {
                 let mut blob = Vec::new();
-                build_strings(layout, &tocs, &mut blob, &mut HashMap::new(), &mut HashMap::new());
+                build_strings(
+                    layout,
+                    &tocs,
+                    &mut blob,
+                    &mut HashMap::new(),
+                    &mut HashMap::new(),
+                );
                 blob == string_blob
             })
             .unwrap_or(TocLayout::Legacy);
@@ -267,7 +275,13 @@ impl Archive {
         let mut string_blob: Vec<u8> = Vec::new();
         let mut folder_str: HashMap<(usize, String), u32> = HashMap::new();
         let mut file_str: HashMap<(usize, String, String), u32> = HashMap::new();
-        build_strings(self.layout, &self.tocs, &mut string_blob, &mut folder_str, &mut file_str);
+        build_strings(
+            self.layout,
+            &self.tocs,
+            &mut string_blob,
+            &mut folder_str,
+            &mut file_str,
+        );
 
         // Build the data blob. When every file preserves its original position
         // (a read→write round-trip), lay the files out in that order so the blob
@@ -301,7 +315,9 @@ impl Archive {
         for (ti, toc) in self.tocs.iter().enumerate() {
             let start = file_entries.len() as u32;
             for event in walk(self.layout, &toc.root) {
-                let WalkEvent::Visit(full, folder) = event else { continue };
+                let WalkEvent::Visit(full, folder) = event else {
+                    continue;
+                };
                 let folder_start = file_entries.len() as u32;
                 for file in &folder.files {
                     let key = (ti, full.clone(), file.name.clone());
@@ -325,7 +341,9 @@ impl Archive {
         for (ti, toc) in self.tocs.iter().enumerate() {
             counter += 1;
             for event in walk(self.layout, &toc.root) {
-                let WalkEvent::Visit(full, folder) = event else { continue };
+                let WalkEvent::Visit(full, folder) = event else {
+                    continue;
+                };
                 let start = counter;
                 counter += folder.folders.len() as u32;
                 folder_range.insert((ti, full), (start, counter));
@@ -351,7 +369,9 @@ impl Archive {
 
             folder_entries.push(mk(""));
             for event in walk(self.layout, &toc.root) {
-                let WalkEvent::Visit(full, folder) = event else { continue };
+                let WalkEvent::Visit(full, folder) = event else {
+                    continue;
+                };
                 for child in &folder.folders {
                     folder_entries.push(mk(&child_path(&full, &child.name)));
                 }
@@ -438,31 +458,66 @@ impl Archive {
         Ok(written)
     }
 
-    /// Returns the decoded bytes of the file at `rel` (a `/`-separated archive
-    /// path, case-insensitive), searching every TOC. Used to read a packed
-    /// `.rgm`/`.layer` back out so it can be patched and re-inserted.
-    pub fn read_file(&self, rel: &str) -> Option<Vec<u8>> {
-        let comps: Vec<String> = rel.split(['/', '\\']).map(|s| s.to_lowercase()).collect();
-        let (name, dirs) = comps.split_last()?;
+    /// The entry at `rel`, if the archive holds one.
+    ///
+    /// `rel` is an archive path separated by `/` or `\\`, matched
+    /// exactly, and every TOC is searched. Names compare as stored: this crate
+    /// does not fold case, because the format does not and neither do
+    /// case-sensitive filesystems. Returns the entry
+    /// itself, so callers can inspect size, storage type or CRC without
+    /// decoding it — see [`FileEntry::decoded`] for the bytes.
+    pub fn file(&self, rel: &str) -> Option<&FileEntry> {
+        let components = rel.split(['/', '\\']).collect::<Vec<_>>();
+        let (name, dirs) = components.split_last()?;
         for toc in &self.tocs {
             let mut folder = &toc.root;
-            let mut ok = true;
-            for d in dirs {
-                match folder.folders.iter().find(|f| f.name.to_lowercase() == *d) {
-                    Some(f) => folder = f,
+            let mut reached = true;
+            for dir in dirs {
+                match folder.folders.iter().find(|f| f.name == *dir) {
+                    Some(child) => folder = child,
                     None => {
-                        ok = false;
+                        reached = false;
                         break;
                     }
                 }
             }
-            if ok {
-                if let Some(f) = folder.files.iter().find(|f| f.name.to_lowercase() == *name) {
-                    return f.decoded().ok();
-                }
+            if reached && let Some(file) = folder.files.iter().find(|f| f.name == *name) {
+                return Some(file);
             }
         }
         None
+    }
+
+    /// The decoded bytes of the file at `rel`.
+    ///
+    /// `Ok(None)` means no such file. A file that is present but cannot be
+    /// decoded is an `Err`, which is the distinction [`Archive::read_file`]
+    /// cannot make.
+    pub fn try_read_file(&self, rel: &str) -> Result<Option<Vec<u8>>> {
+        self.file(rel).map(FileEntry::decoded).transpose()
+    }
+
+    /// The decoded bytes of the file at `rel`, or `None`.
+    ///
+    /// A file that is present but fails to decode also reports `None`. Prefer
+    /// [`Archive::try_read_file`] where telling those apart matters; this
+    /// remains for callers that genuinely only want the bytes or nothing.
+    pub fn read_file(&self, rel: &str) -> Option<Vec<u8>> {
+        self.try_read_file(rel).ok().flatten()
+    }
+
+    /// Every file in the archive, paired with the TOC holding it and its full
+    /// path within that TOC.
+    ///
+    /// Saves callers flat-mapping [`Folder::files_recursive`] over
+    /// [`Archive::tocs`] when they need the TOC alongside each file, which the
+    /// per-folder walk cannot supply.
+    pub fn files(&self) -> impl Iterator<Item = (&Toc, String, &FileEntry)> + '_ {
+        self.tocs.iter().flat_map(|toc| {
+            toc.root
+                .files_recursive()
+                .map(move |(path, file)| (toc, path, file))
+        })
     }
 
     /// Removes every file whose lowercased name matches `pred`, across all TOCs,
@@ -549,7 +604,9 @@ impl Archive {
             for child in &mut folder.folders {
                 prune(child);
             }
-            folder.folders.retain(|c| !(c.files.is_empty() && c.folders.is_empty()));
+            folder
+                .folders
+                .retain(|c| !(c.files.is_empty() && c.folders.is_empty()));
         }
         for toc in &mut self.tocs {
             prune(&mut toc.root);
@@ -565,12 +622,15 @@ impl Archive {
             let _ = get_or_create_toc(&mut self.tocs, "data");
         }
         let relp = PathBuf::from(rel.replace('\\', "/"));
-        let comps: Vec<String> =
-            rel.split(['/', '\\']).map(|s| s.to_lowercase()).collect();
+        let comps: Vec<String> = rel.split(['/', '\\']).map(|s| s.to_lowercase()).collect();
         if let Some((name, dirs)) = comps.split_last() {
             for toc in &mut self.tocs {
                 if let Some(folder) = descend_existing(&mut toc.root, dirs) {
-                    if let Some(f) = folder.files.iter_mut().find(|f| &f.name == name) {
+                    if let Some(f) = folder
+                        .files
+                        .iter_mut()
+                        .find(|f| f.name.to_lowercase() == *name)
+                    {
                         *f = stored_file(&relp, data);
                         return;
                     }
@@ -579,7 +639,6 @@ impl Archive {
         }
         insert_or_replace(&mut self.tocs[0].root, &relp, stored_file(&relp, data));
     }
-
 }
 
 pub(crate) fn stored_file(rel: &Path, data: Vec<u8>) -> FileEntry {
@@ -618,6 +677,12 @@ pub(crate) fn get_or_create_toc<'a>(tocs: &'a mut Vec<Toc>, alias: &str) -> &'a 
 }
 
 /// Inserts `file` at `rel` under `root`, replacing any file already there.
+///
+/// Names are lowercased on the way in. That is deliberate rather than
+/// incidental: every shipped archive is lowercase throughout, and a fresh pack
+/// has to match the editor's own build. It does mean a caller's casing is not
+/// preserved, so lookups against a pack this crate built should use lowercase.
+/// Reads do not fold case — see [`Archive::file`].
 pub(crate) fn insert_or_replace(root: &mut Folder, rel: &Path, mut file: FileEntry) {
     file.name = file.name.to_lowercase();
     let folder = descend(root, rel);
@@ -645,7 +710,7 @@ pub(crate) fn insert_file(root: &mut Folder, rel: &Path, mut file: FileEntry) {
 fn descend_existing<'a>(root: &'a mut Folder, dirs: &[String]) -> Option<&'a mut Folder> {
     let mut folder = root;
     for d in dirs {
-        let idx = folder.folders.iter().position(|f| &f.name == d)?;
+        let idx = folder.folders.iter().position(|f| f.name == *d)?;
         folder = &mut folder.folders[idx];
     }
     Some(folder)
@@ -868,19 +933,19 @@ fn build_folder<R: Read + Seek>(
 
     let mut file_nodes = Vec::new();
     for i in entry.file_start_index..entry.file_end_index {
-        file_nodes.push(build_file(reader, header, &files[i as usize], strings, version)?);
+        file_nodes.push(build_file(
+            reader,
+            header,
+            &files[i as usize],
+            strings,
+            version,
+        )?);
     }
 
     let mut folder_nodes = Vec::new();
     for i in entry.folder_start_index..entry.folder_end_index {
         folder_nodes.push(build_folder(
-            reader,
-            header,
-            folders,
-            files,
-            strings,
-            i as usize,
-            version,
+            reader, header, folders, files, strings, i as usize, version,
         )?);
     }
 
@@ -951,4 +1016,3 @@ fn extract_folder(folder: &Folder, base: &Path, written: &mut Vec<PathBuf>) -> R
 
     Ok(())
 }
-

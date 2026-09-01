@@ -1,9 +1,9 @@
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 
-use binrw::{binrw, BinRead, BinWrite};
+use binrw::{BinRead, BinWrite, binrw};
 use thiserror::Error;
 
-use crate::entires::FileEncryptionType;
+use crate::entries::FileEncryptionType;
 use crate::utils::{name_units, parse_index, parse_wide, utf16_name, write_index, write_wide};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -273,11 +273,27 @@ impl SgaHeader {
             reserved: {
                 let defaults = HeaderReserved::default();
                 HeaderReserved {
-                    pre_name: if version < 6 { main.pre_name } else { defaults.pre_name },
-                    post_name: if version < 6 { main.post_name } else { defaults.post_name },
-                    v5: if version == 5 { main.v5_extra } else { defaults.v5 },
+                    pre_name: if version < 6 {
+                        main.pre_name
+                    } else {
+                        defaults.pre_name
+                    },
+                    post_name: if version < 6 {
+                        main.post_name
+                    } else {
+                        defaults.post_name
+                    },
+                    v5: if version == 5 {
+                        main.v5_extra
+                    } else {
+                        defaults.v5
+                    },
                     pad: if version < 11 { main.pad } else { defaults.pad },
-                    v11_one: if version >= 11 { main.v11_one } else { defaults.v11_one },
+                    v11_one: if version >= 11 {
+                        main.v11_one
+                    } else {
+                        defaults.v11_one
+                    },
                 }
             },
         })

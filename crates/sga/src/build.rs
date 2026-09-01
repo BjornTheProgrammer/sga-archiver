@@ -1,13 +1,12 @@
-
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::archive::{
-    encode, get_or_create_toc, insert_file, insert_or_replace, stored_file, Archive, FileEntry,
-    Folder, Toc, TocLayout, DEFAULT_BLOCK_SIZE,
+    Archive, DEFAULT_BLOCK_SIZE, FileEntry, Folder, Toc, TocLayout, encode, get_or_create_toc,
+    insert_file, insert_or_replace, stored_file,
 };
-use crate::entires::{FileEncryptionType, FileStorageType, FileVerificationType, HeaderReserved};
+use crate::entries::{FileEncryptionType, FileStorageType, FileVerificationType, HeaderReserved};
 use flate2::Crc;
 
 pub fn from_dir<P: AsRef<Path>>(name: &str, dir: P) -> Result<Archive> {
@@ -151,7 +150,10 @@ fn add_burned_files(
                 stack.push(path);
                 continue;
             }
-            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case(source_ext)) {
+            if !path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case(source_ext))
+            {
                 continue;
             }
             let rel = path.strip_prefix(assets).unwrap_or(&path).to_path_buf();
@@ -163,7 +165,10 @@ fn add_burned_files(
                 continue;
             };
 
-            let stem = rel.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let stem = rel
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let bytes = compile(&path, &stem)?;
             let out_rel = burned_output_path(&rel, out_ext);
             let file = stored_file(&out_rel, bytes);
@@ -176,28 +181,49 @@ fn add_burned_files(
 
 /// Compiles reflection `.rdo` sources into `.bin`s (the `ReflectBurner`).
 fn add_reflection_bins(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
-    add_burned_files(tocs, assets, "ReflectBurner", "rdo", "bin", |path, _stem| {
-        let rdo_xml = std::fs::read_to_string(path)?;
-        relic_chunky::reflect_write::compile_bin(&rdo_xml)
-            .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
-    })
+    add_burned_files(
+        tocs,
+        assets,
+        "ReflectBurner",
+        "rdo",
+        "bin",
+        |path, _stem| {
+            let rdo_xml = std::fs::read_to_string(path)?;
+            relic_chunky::reflect_write::compile_bin(&rdo_xml)
+                .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
+        },
+    )
 }
 
 fn add_attribute_rgds(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
-    add_burned_files(tocs, assets, "Mod Attributes", "xml", "rgd", |path, _stem| {
-        let xml = std::fs::read_to_string(path)?;
-        relic_chunky::attrib::compile_attrib(&xml)
-            .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
-    })
+    add_burned_files(
+        tocs,
+        assets,
+        "Mod Attributes",
+        "xml",
+        "rgd",
+        |path, _stem| {
+            let xml = std::fs::read_to_string(path)?;
+            relic_chunky::attrib::compile_attrib(&xml)
+                .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
+        },
+    )
 }
 
 /// Compiles PNG sources into `.rrtex` textures (the `RRTextureBurner`).
 fn add_texture_bins(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
-    add_burned_files(tocs, assets, "RRTextureBurner", "png", "rrtex", |path, stem| {
-        let png = std::fs::read(path)?;
-        relic_chunky::texture::compile_texture(&png, stem)
-            .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
-    })
+    add_burned_files(
+        tocs,
+        assets,
+        "RRTextureBurner",
+        "png",
+        "rrtex",
+        |path, stem| {
+            let png = std::fs::read(path)?;
+            relic_chunky::texture::compile_texture(&png, stem)
+                .map_err(|e| anyhow!("compiling {}: {e:#}", path.display()))
+        },
+    )
 }
 
 /// Compiles localization CSVs into `.ucs` string tables (the `UCS` burner).
@@ -222,7 +248,10 @@ fn add_localization(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
                 stack.push(path);
                 continue;
             }
-            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("locdb")) {
+            if !path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("locdb"))
+            {
                 continue;
             }
             let rel = path.strip_prefix(assets).unwrap_or(&path).to_path_buf();
@@ -234,16 +263,24 @@ fn add_localization(tocs: &mut Vec<Toc>, assets: &Path) -> Result<()> {
                 continue;
             };
 
-            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let prefix = format!("{stem}_");
             let locdb_dir = path.parent().unwrap_or(assets).to_path_buf();
             // Each sibling `<stem>_<locale>.csv` is one locale's string table.
             for sibling in std::fs::read_dir(&locdb_dir)?.flatten().map(|e| e.path()) {
-                if !sibling.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv")) {
+                if !sibling
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("csv"))
+                {
                     continue;
                 }
-                let file_stem =
-                    sibling.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let file_stem = sibling
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 let Some(locale) = file_stem.strip_prefix(&prefix) else {
                     continue;
                 };
@@ -264,7 +301,10 @@ fn find_burnproj(assets: &Path) -> Option<PathBuf> {
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("burnproj")))
+        .find(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("burnproj"))
+        })
 }
 
 /// Extracts the `ReflectBurner` rules from a `.burnproj` by lightweight tag
@@ -272,7 +312,10 @@ fn find_burnproj(assets: &Path) -> Option<PathBuf> {
 fn parse_burn_rules(xml: &str, burner: &str) -> Vec<BurnRule> {
     let mut rules = Vec::new();
     for block in xml.split("<BurnRule>").skip(1) {
-        let block = block.split_once("</BurnRule>").map(|(b, _)| b).unwrap_or(block);
+        let block = block
+            .split_once("</BurnRule>")
+            .map(|(b, _)| b)
+            .unwrap_or(block);
         if tag_value(block, "Burner").as_deref() != Some(burner) {
             continue;
         }
@@ -361,11 +404,16 @@ fn read_guid(dir: &Path) -> Result<String> {
     let aoe4mod = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("aoe4mod")))
+        .find(|p| {
+            p.extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("aoe4mod"))
+        })
         .ok_or_else(|| anyhow!("no .aoe4mod file found in {}", dir.display()))?;
     let content = std::fs::read_to_string(&aoe4mod)?;
-    let start =
-        content.find("<ID>").ok_or_else(|| anyhow!("no <ID> in {}", aoe4mod.display()))? + 4;
+    let start = content
+        .find("<ID>")
+        .ok_or_else(|| anyhow!("no <ID> in {}", aoe4mod.display()))?
+        + 4;
     let end = content[start..]
         .find("</ID>")
         .ok_or_else(|| anyhow!("malformed <ID> in {}", aoe4mod.display()))?

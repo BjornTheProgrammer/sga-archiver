@@ -40,7 +40,10 @@ pub fn write_wide(value: &u64, version: u16) -> BinResult<()> {
 }
 
 pub fn utf16_name(units: &[u16; 64]) -> String {
-    let len = units.iter().position(|&unit| unit == 0).unwrap_or(units.len());
+    let len = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(units.len());
     String::from_utf16_lossy(&units[..len])
 }
 

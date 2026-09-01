@@ -5,7 +5,7 @@
 use std::fs::File;
 use std::io::BufReader;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use sga::{Archive, FileEntry, Folder};
 
 fn collect<'a>(folder: &'a Folder, prefix: &str, out: &mut Vec<(String, &'a FileEntry)>) {
@@ -27,14 +27,24 @@ fn entries(archive: &Archive) -> Vec<(String, &FileEntry)> {
 }
 
 fn main() -> Result<()> {
-    let a_path = std::env::args().nth(1).ok_or_else(|| anyhow!("need two .sga paths"))?;
-    let b_path = std::env::args().nth(2).ok_or_else(|| anyhow!("need two .sga paths"))?;
+    let a_path = std::env::args()
+        .nth(1)
+        .ok_or_else(|| anyhow!("need two .sga paths"))?;
+    let b_path = std::env::args()
+        .nth(2)
+        .ok_or_else(|| anyhow!("need two .sga paths"))?;
     let a = Archive::read(&mut BufReader::new(File::open(&a_path)?))?;
     let b = Archive::read(&mut BufReader::new(File::open(&b_path)?))?;
 
     let ea = entries(&a);
     let eb = entries(&b);
-    println!("{}: {} files, {}: {} files", a_path, ea.len(), b_path, eb.len());
+    println!(
+        "{}: {} files, {}: {} files",
+        a_path,
+        ea.len(),
+        b_path,
+        eb.len()
+    );
 
     for (name, fa) in &ea {
         let Some((_, fb)) = eb.iter().find(|(n, _)| n == name) else {
@@ -43,19 +53,37 @@ fn main() -> Result<()> {
         };
         let mut notes = Vec::new();
         if fa.storage_type != fb.storage_type {
-            notes.push(format!("storage {:?} vs {:?}", fa.storage_type, fb.storage_type));
+            notes.push(format!(
+                "storage {:?} vs {:?}",
+                fa.storage_type, fb.storage_type
+            ));
         }
         if fa.stored_data.len() != fb.stored_data.len() {
-            notes.push(format!("stored len {} vs {}", fa.stored_data.len(), fb.stored_data.len()));
+            notes.push(format!(
+                "stored len {} vs {}",
+                fa.stored_data.len(),
+                fb.stored_data.len()
+            ));
         } else if fa.stored_data != fb.stored_data {
-            let at = fa.stored_data.iter().zip(&fb.stored_data).position(|(x, y)| x != y).unwrap();
-            notes.push(format!("stored bytes differ from +{at} (len {})", fa.stored_data.len()));
+            let at = fa
+                .stored_data
+                .iter()
+                .zip(&fb.stored_data)
+                .position(|(x, y)| x != y)
+                .unwrap();
+            notes.push(format!(
+                "stored bytes differ from +{at} (len {})",
+                fa.stored_data.len()
+            ));
         }
         if fa.crc != fb.crc {
             notes.push(format!("crc {:#x} vs {:#x}", fa.crc, fb.crc));
         }
         if fa.data_order != fb.data_order {
-            notes.push(format!("data order {:?} vs {:?}", fa.data_order, fb.data_order));
+            notes.push(format!(
+                "data order {:?} vs {:?}",
+                fa.data_order, fb.data_order
+            ));
         }
         if !notes.is_empty() {
             println!("{name}: {}", notes.join("; "));
@@ -93,7 +121,10 @@ fn main() -> Result<()> {
             let mut by_order: Vec<_> = list.clone();
             by_order.sort_by_key(|(_, f)| f.data_order);
             for (name, f) in by_order {
-                println!("  {:>9} {name}", f.data_order.map(|o| o.to_string()).unwrap_or_default());
+                println!(
+                    "  {:>9} {name}",
+                    f.data_order.map(|o| o.to_string()).unwrap_or_default()
+                );
             }
         }
     }

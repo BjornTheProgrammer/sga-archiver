@@ -1,6 +1,6 @@
 //! Walking a folder tree: full paths, and counts.
 
-use sga::entires::{FileEncryptionType, FileStorageType, FileVerificationType};
+use sga::entries::{FileEncryptionType, FileStorageType, FileVerificationType};
 use sga::{FileEntry, Folder};
 
 fn stored(name: &str) -> FileEntry {
@@ -48,7 +48,10 @@ fn paths_are_relative_to_the_folder_and_use_the_archive_separator() {
     // The root's own name is not part of the paths, matching the way a TOC
     // treats its root, and the separator is the one the string blob stores.
     let root = sample();
-    let paths = root.files_recursive().map(|(path, _)| path).collect::<Vec<_>>();
+    let paths = root
+        .files_recursive()
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
     assert_eq!(
         paths,
         vec![
@@ -65,7 +68,10 @@ fn paths_are_relative_to_the_folder_and_use_the_archive_separator() {
 fn a_nested_folder_is_walked_as_its_own_root() {
     let root = sample();
     let art = &root.folders[0];
-    let paths = art.files_recursive().map(|(path, _)| path).collect::<Vec<_>>();
+    let paths = art
+        .files_recursive()
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
     assert_eq!(
         paths,
         vec!["mod.rrtex", r"scenario\house.rgm", r"scenario\house.rgo"]
@@ -87,15 +93,7 @@ fn folders_are_walked_without_yielding_the_starting_folder() {
         .folders_recursive()
         .map(|(path, _)| path)
         .collect::<Vec<_>>();
-    assert_eq!(
-        paths,
-        vec![
-            "art",
-            r"art\scenario",
-            r"art\empty",
-            "attrib",
-        ]
-    );
+    assert_eq!(paths, vec!["art", r"art\scenario", r"art\empty", "attrib",]);
 }
 
 #[test]
