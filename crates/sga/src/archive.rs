@@ -64,50 +64,79 @@ impl Folder {
     /// Every file at or beneath this folder, paired with its full path.
     ///
     /// Paths are relative to this folder and joined with the archive's own
-    /// separator, the same form the TOC string blob stores. This folder's own
-    /// name is not part of them, matching the way a TOC treats its root.
+    /// separator, the form the TOC string blob stores. This folder's own name
+    /// is not part of them, matching the way a TOC treats its root.
     ///
-    /// Order is depth-first: a folder's own files, then each subfolder in
-    /// turn.
-    pub fn files_recursive(&self) -> Vec<(String, &FileEntry)> {
-        fn collect<'a>(prefix: &str, folder: &'a Folder, out: &mut Vec<(String, &'a FileEntry)>) {
-            for file in &folder.files {
-                out.push((child_path(prefix, &file.name), file));
-            }
-            for child in &folder.folders {
-                collect(&child_path(prefix, &child.name), child, out);
-            }
+    /// Depth-first: a folder's own files, then each subfolder in turn.
+    ///
+    /// The field [`Folder::files`] holds only the *direct* children; this
+    /// walks the whole tree.
+    pub fn files_recursive(&self) -> Files<'_> {
+        Files {
+            pending: Vec::new(),
+            current: Some((String::new(), self, 0)),
         }
-        let mut out = Vec::new();
-        collect("", self, &mut out);
-        out
     }
 
-    /// The full path of every file at or beneath this folder.
+    /// Every folder beneath this folder, paired with its full path.
     ///
-    /// The paths [`Folder::files_recursive`] produces, without the entries.
-    pub fn file_paths(&self) -> Vec<String> {
-        self.files_recursive()
-            .into_iter()
-            .map(|(path, _)| path)
-            .collect()
-    }
-
-    /// How many files are at or beneath this folder, at any depth.
-    pub fn file_count(&self) -> usize {
-        self.files.len() + self.folders.iter().map(Folder::file_count).sum::<usize>()
-    }
-
-    /// How many folders are beneath this folder, at any depth.
-    ///
-    /// This folder is not counted; a leaf folder reports zero.
-    pub fn folder_count(&self) -> usize {
-        self.folders.len()
-            + self
+    /// Same order and path form as [`Folder::files_recursive`]. This folder is
+    /// not yielded; only its descendants, so a leaf yields nothing.
+    pub fn folders_recursive(&self) -> Folders<'_> {
+        Folders {
+            pending: self
                 .folders
                 .iter()
-                .map(Folder::folder_count)
-                .sum::<usize>()
+                .rev()
+                .map(|child| (child.name.clone(), child))
+                .collect(),
+        }
+    }
+}
+
+/// Iterator over a folder tree's files. See [`Folder::files_recursive`].
+pub struct Files<'a> {
+    /// Folders not yet reached, each with the prefix its contents take.
+    pending: Vec<(String, &'a Folder)>,
+    /// The folder being drained, and how far through its files we are.
+    current: Option<(String, &'a Folder, usize)>,
+}
+
+impl<'a> Iterator for Files<'a> {
+    type Item = (String, &'a FileEntry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (prefix, folder, index) = self.current.as_mut()?;
+            if let Some(file) = folder.files.get(*index) {
+                *index += 1;
+                return Some((child_path(prefix, &file.name), file));
+            }
+            // This folder is drained; queue its children and move on. Reversed
+            // so popping yields them in declaration order.
+            let (prefix, folder, _) = self.current.take()?;
+            for child in folder.folders.iter().rev() {
+                self.pending.push((child_path(&prefix, &child.name), child));
+            }
+            self.current = self.pending.pop().map(|(prefix, folder)| (prefix, folder, 0));
+        }
+    }
+}
+
+/// Iterator over a folder tree's folders. See [`Folder::folders_recursive`].
+pub struct Folders<'a> {
+    pending: Vec<(String, &'a Folder)>,
+}
+
+impl<'a> Iterator for Folders<'a> {
+    type Item = (String, &'a Folder);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (path, folder) = self.pending.pop()?;
+        for child in folder.folders.iter().rev() {
+            self.pending.push((child_path(&path, &child.name), child));
+        }
+        Some((path, folder))
     }
 }
 
@@ -419,7 +448,7 @@ impl Archive {
             let mut folder = &toc.root;
             let mut ok = true;
             for d in dirs {
-                match folder.folders.iter().find(|f| &f.name == d) {
+                match folder.folders.iter().find(|f| f.name.to_lowercase() == *d) {
                     Some(f) => folder = f,
                     None => {
                         ok = false;
@@ -428,7 +457,7 @@ impl Archive {
                 }
             }
             if ok {
-                if let Some(f) = folder.files.iter().find(|f| &f.name == name) {
+                if let Some(f) = folder.files.iter().find(|f| f.name.to_lowercase() == *name) {
                     return f.decoded().ok();
                 }
             }
