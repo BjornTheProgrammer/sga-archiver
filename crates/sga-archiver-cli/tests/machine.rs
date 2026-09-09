@@ -513,3 +513,88 @@ fn failures_leave_stdout_empty() {
     let stderr = fails(&["inspect", &s(&sandbox.path("missing.sga"))]);
     assert!(stderr.contains("failed to read SGA"), "{stderr}");
 }
+
+fn assert_sorted(folder: &sga::Folder) {
+    let names = |pairs: &[String]| pairs.windows(2).all(|w| w[0] <= w[1]);
+    assert!(names(
+        &folder
+            .folders
+            .iter()
+            .map(|f| f.name.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    ));
+    assert!(names(
+        &folder
+            .files
+            .iter()
+            .map(|f| f.name.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    ));
+    for child in &folder.folders {
+        assert_sorted(child);
+    }
+}
+
+fn member<'a>(archive: &'a Archive, path: &str) -> Vec<u8> {
+    archive
+        .files()
+        .find(|(_, p, _)| p.replace('\\', "/").eq_ignore_ascii_case(path))
+        .unwrap()
+        .2
+        .decoded()
+        .unwrap()
+}
+
+#[test]
+fn graft_sorts_new_siblings_and_preserves_payloads() {
+    // The game searches directory tables by name, so a sibling appended out of
+    // order is never found. Insertion keeps the order and writing re-checks it.
+    let sandbox = Sandbox::new("directory-order");
+    let base = sandbox.path("base.sga");
+    let donor = sandbox.path("donor.sga");
+    let output = sandbox.path("sorted.sga");
+    let mut archive = empty("0123456789abcdef0123456789abcdef");
+    archive.upsert_stored_in("data", "z/z.rgo", b"existing".to_vec());
+    write_archive(&archive, &base);
+    archive.upsert_stored_in("data", "A/B.rgm", b"new".to_vec());
+    archive.upsert_stored_in("data", "z/A.rpb", b"another".to_vec());
+    for toc in &archive.tocs {
+        assert_sorted(&toc.root);
+    }
+    write_archive(&archive, &donor);
+    ok(&[
+        "graft",
+        &s(&base),
+        &s(&donor),
+        &s(&output),
+        "A/B.rgm",
+        "z/A.rpb",
+    ]);
+    let result = sga::read_archive(&output).unwrap();
+    for toc in &result.tocs {
+        assert_sorted(&toc.root);
+    }
+    assert_eq!(member(&result, "z/z.rgo"), b"existing");
+    assert_eq!(member(&result, "A/B.rgm"), b"new");
+    assert_eq!(member(&result, "z/A.rpb"), b"another");
+}
+
+#[test]
+fn a_hand_built_tree_is_sorted_before_it_is_written() {
+    let sandbox = Sandbox::new("directory-order-manual");
+    let input = sandbox.path("unsorted.sga");
+    let output = sandbox.path("repacked.sga");
+    let mut archive = empty("0123456789abcdef0123456789abcdef");
+    archive.upsert_stored_in("data", "b/b.rgo", b"b".to_vec());
+    archive.upsert_stored_in("data", "a/a.rgo", b"a".to_vec());
+    // Undo the ordering by hand, the way a caller that edits the tree could.
+    archive.tocs[0].root.folders.reverse();
+    write_archive(&archive, &input);
+    ok(&["repack", &s(&input), &s(&output)]);
+    let result = sga::read_archive(&output).unwrap();
+    for toc in &result.tocs {
+        assert_sorted(&toc.root);
+    }
+    assert_eq!(member(&result, "a/a.rgo"), b"a");
+    assert_eq!(member(&result, "b/b.rgo"), b"b");
+}

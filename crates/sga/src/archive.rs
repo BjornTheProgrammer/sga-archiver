@@ -601,6 +601,18 @@ impl Archive {
         Ok(n)
     }
 
+    /// Puts every folder's children in the order the game's directory tables
+    /// expect: case-insensitive by name, folders and files alike, across all
+    /// TOCs. The game searches those tables by name, so a sibling appended out
+    /// of order is simply never found. Insertion through
+    /// [`Archive::upsert_stored_in`] keeps the order already; this covers a
+    /// tree that was built or edited by hand.
+    pub fn sort_directories(&mut self) {
+        for toc in &mut self.tocs {
+            sort_folder(&mut toc.root);
+        }
+    }
+
     /// Removes folders that (recursively) contain no files, across all TOCs.
     /// Editor archives never carry empty folders; leaving them after a delete
     /// can make the game reject the mod's file structure.
@@ -693,7 +705,28 @@ pub(crate) fn insert_or_replace(root: &mut Folder, rel: &Path, mut file: FileEnt
     let folder = descend(root, rel);
     match folder.files.iter().position(|f| f.name == file.name) {
         Some(i) => folder.files[i] = file,
-        None => folder.files.push(file),
+        None => {
+            // Keep the table in the game's search order (see `sort_folder`).
+            let at = folder
+                .files
+                .partition_point(|f| f.name.to_ascii_lowercase() < file.name.to_ascii_lowercase());
+            folder.files.insert(at, file);
+        }
+    }
+}
+
+/// Orders a folder's children the way the game's directory tables are
+/// searched: case-insensitive by name, recursively. Stable, so entries that
+/// only differ in case keep their relative order.
+pub(crate) fn sort_folder(folder: &mut Folder) {
+    folder
+        .folders
+        .sort_by_key(|entry| entry.name.to_ascii_lowercase());
+    folder
+        .files
+        .sort_by_key(|entry| entry.name.to_ascii_lowercase());
+    for child in &mut folder.folders {
+        sort_folder(child);
     }
 }
 
@@ -730,12 +763,19 @@ fn descend<'a>(root: &'a mut Folder, rel: &Path) -> &'a mut Folder {
                 let idx = match folder.folders.iter().position(|f| f.name == name) {
                     Some(i) => i,
                     None => {
-                        folder.folders.push(Folder {
-                            name,
-                            folders: Vec::new(),
-                            files: Vec::new(),
-                        });
-                        folder.folders.len() - 1
+                        // Keep the table in the game's search order (see `sort_folder`).
+                        let at = folder
+                            .folders
+                            .partition_point(|f| f.name.to_ascii_lowercase() < name);
+                        folder.folders.insert(
+                            at,
+                            Folder {
+                                name,
+                                folders: Vec::new(),
+                                files: Vec::new(),
+                            },
+                        );
+                        at
                     }
                 };
                 folder = &mut folder.folders[idx];

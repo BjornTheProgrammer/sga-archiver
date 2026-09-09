@@ -431,7 +431,12 @@ fn read_eager(path: &Path, role: &str) -> Result<Archive> {
     sga::read_archive(path).with_context(|| format!("failed to read {role} SGA {}", path.display()))
 }
 
-fn write_eager(archive: &Archive, output: &Path) -> Result<()> {
+fn write_eager(archive: &mut Archive, output: &Path) -> Result<()> {
+    // A tree read from an archive the editor wrote is already in order;
+    // anything grafted or replaced here was inserted in order. Sorting once
+    // more before writing costs nothing and guarantees it for a tree that
+    // arrived out of order, which the game answers with a missing file.
+    archive.sort_directories();
     let mut writer =
         File::create(output).with_context(|| format!("failed to create {}", output.display()))?;
     archive
@@ -444,8 +449,8 @@ pub fn repack(input: &Path, output: &Path) -> Result<Value> {
         bail!("input and output must be different paths");
     }
     refuse_existing(output)?;
-    let archive = read_eager(input, "input")?;
-    write_eager(&archive, output)?;
+    let mut archive = read_eager(input, "input")?;
+    write_eager(&mut archive, output)?;
     Ok(envelope(
         "repack",
         json!({"input": input, "output": output, "archive": archive_summary(&archive)}),
@@ -509,7 +514,7 @@ pub fn graft(base: &Path, donor: &Path, output: &Path, members: &[String]) -> Re
         let data = donor_bytes(&donor_archive, member)?;
         archive.upsert_stored_in(&toc_alias, member, data);
     }
-    write_eager(&archive, output)?;
+    write_eager(&mut archive, output)?;
     Ok(envelope(
         "graft",
         json!({
@@ -542,7 +547,7 @@ pub fn graft_as(
         let data = donor_bytes(&donor_archive, source)?;
         archive.upsert_stored_in(&toc_alias, target, data);
     }
-    write_eager(&archive, output)?;
+    write_eager(&mut archive, output)?;
     Ok(envelope(
         "graft-as",
         json!({
@@ -569,7 +574,7 @@ pub fn replace_member(base: &Path, payload: &Path, output: &Path, member: &str) 
         .with_context(|| format!("failed to read payload {}", payload.display()))?;
     let size = data.len();
     archive.upsert_stored_in(&toc_alias, member, data);
-    write_eager(&archive, output)?;
+    write_eager(&mut archive, output)?;
     Ok(envelope(
         "replace-member",
         json!({
