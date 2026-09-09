@@ -19,6 +19,17 @@ commits, and design discussions.
 - **Reserved header bytes** — version-specific regions the crate preserves
   verbatim rather than interpreting (`HeaderReserved`), so round-trips never
   rewrite bytes they didn't understand.
+- **Index** — `ArchiveIndex`: the header, tables and every member's offsets
+  and types, with no member bytes. `ArchiveReader` pairs an index with the
+  open file and reads members on demand; `Archive` is the eager form built
+  from the same index for callers that will write.
+- **Verification** — a data-integrity check of stored bytes against the
+  recorded CRC32 and SHA1 block hashes. Not a signature or authenticity check.
+- **Encrypted member** — one whose entry carries an encryption type. The
+  crate does not decrypt; decoding one is an `EncryptedMember` error, never
+  ciphertext handed back as the member.
+- **Machine command** — a CLI subcommand that prints one JSON object and
+  nothing else, for other programs to drive the archiver (`crates/sga-archiver-cli`).
 - **Build pipeline** — `compile_project`: source tree → burned files → routed
   TOCs → Archive, driven by the `.burnproj` rules.
 - **Burner** — one source-to-asset compiler named by the burnproj:

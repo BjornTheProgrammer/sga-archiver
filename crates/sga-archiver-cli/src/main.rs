@@ -1,3 +1,5 @@
+mod machine;
+
 use std::{
     fs,
     io::BufReader,
@@ -20,6 +22,9 @@ struct Cli {
     command: Command,
 }
 
+/// `pack` and `unpack` talk to a person. Every other command prints exactly
+/// one JSON object on stdout so another program can drive the archiver; see
+/// [`machine`].
 #[derive(Subcommand)]
 enum Command {
     /// Compile a mod source directory into an `.sga` archive.
@@ -38,21 +43,165 @@ enum Command {
         #[arg(short, long, value_name = "DIR")]
         output: PathBuf,
     },
+    /// Describe an archive and name its members, without reading their bytes (JSON).
+    Inspect {
+        /// Input `.sga` archive.
+        input: PathBuf,
+    },
+    /// List members with size, storage, encryption and verification details (JSON).
+    List {
+        /// Input `.sga` archive.
+        input: PathBuf,
+        /// Only members whose path contains this text, compared case-insensitively.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Also check every member's stored bytes against its recorded CRC and
+        /// SHA1 block hashes. Reads the whole archive once.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Write one member's decoded bytes to a file (JSON).
+    ExtractMember {
+        /// Input `.sga` archive.
+        input: PathBuf,
+        /// Archive path of the member, with either separator.
+        member: String,
+        /// Output file; must not already exist.
+        output: PathBuf,
+    },
+    /// Write selected members under a directory, keeping their archive paths (JSON).
+    Extract {
+        /// Input `.sga` archive.
+        input: PathBuf,
+        /// Output directory.
+        output: PathBuf,
+        /// Members whose path contains this text, compared case-insensitively.
+        #[arg(long)]
+        filter: Option<String>,
+        /// An exact member to extract; repeatable.
+        #[arg(long = "member")]
+        members: Vec<String>,
+    },
+    /// Decode a compiled `.rgd` to XML (JSON).
+    DecodeRgd { input: PathBuf, output: PathBuf },
+    /// Replace every CString equal to OLD with NEW inside an `.rgd` (JSON).
+    PatchRgdCstring {
+        input: PathBuf,
+        output: PathBuf,
+        old: String,
+        new: String,
+        /// The patch is refused unless exactly this many values change.
+        expected_count: usize,
+    },
+    /// Replace every Float under KEY equal to OLD with NEW inside an `.rgd` (JSON).
+    PatchRgdF32 {
+        input: PathBuf,
+        output: PathBuf,
+        key: String,
+        old: f32,
+        new: f32,
+        /// The patch is refused unless exactly this many values change.
+        expected_count: usize,
+    },
+    /// Compile a mod source directory and describe the result (JSON).
+    CompileProject { project: PathBuf, output: PathBuf },
+    /// Read an archive and write it back (JSON).
+    Repack { input: PathBuf, output: PathBuf },
+    /// Copy members from a donor archive into a base archive (JSON).
+    Graft {
+        base: PathBuf,
+        donor: PathBuf,
+        output: PathBuf,
+        #[arg(required = true)]
+        members: Vec<String>,
+    },
+    /// Copy donor members into a base archive under new paths (JSON).
+    GraftAs {
+        base: PathBuf,
+        donor: PathBuf,
+        output: PathBuf,
+        /// `source=target` pairs.
+        #[arg(required = true)]
+        mappings: Vec<String>,
+    },
+    /// Replace one existing member's bytes with a file's contents (JSON).
+    ReplaceMember {
+        base: PathBuf,
+        payload: PathBuf,
+        output: PathBuf,
+        member: String,
+    },
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let value = match Cli::parse().command {
         Command::Pack { input, output } => {
             sga::compile(&input, &output)?;
             println!("Packed {} into {}", input.display(), output.display());
+            return Ok(());
         }
         Command::Unpack { input, output } => {
             let written = extract_all(&input, &output)?;
             decode_rgd_files(&written);
             decode_reflect_files(&written);
             write_aoe4mod(&input, &output, &written)?;
+            return Ok(());
         }
-    }
+        Command::Inspect { input } => machine::inspect(&input)?,
+        Command::List {
+            input,
+            filter,
+            verify,
+        } => machine::list(&input, filter.as_deref(), verify)?,
+        Command::ExtractMember {
+            input,
+            member,
+            output,
+        } => machine::extract_member(&input, &member, &output)?,
+        Command::Extract {
+            input,
+            output,
+            filter,
+            members,
+        } => machine::extract(&input, &output, filter.as_deref(), &members)?,
+        Command::DecodeRgd { input, output } => machine::decode_rgd(&input, &output)?,
+        Command::PatchRgdCstring {
+            input,
+            output,
+            old,
+            new,
+            expected_count,
+        } => machine::patch_rgd_cstring(&input, &output, &old, &new, expected_count)?,
+        Command::PatchRgdF32 {
+            input,
+            output,
+            key,
+            old,
+            new,
+            expected_count,
+        } => machine::patch_rgd_f32(&input, &output, &key, old, new, expected_count)?,
+        Command::CompileProject { project, output } => machine::compile_project(&project, &output)?,
+        Command::Repack { input, output } => machine::repack(&input, &output)?,
+        Command::Graft {
+            base,
+            donor,
+            output,
+            members,
+        } => machine::graft(&base, &donor, &output, &members)?,
+        Command::GraftAs {
+            base,
+            donor,
+            output,
+            mappings,
+        } => machine::graft_as(&base, &donor, &output, &machine::parse_mappings(&mappings)?)?,
+        Command::ReplaceMember {
+            base,
+            payload,
+            output,
+            member,
+        } => machine::replace_member(&base, &payload, &output, &member)?,
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
@@ -60,9 +209,10 @@ fn write_aoe4mod(input: &Path, output: &Path, written_files: &[PathBuf]) -> Resu
     let header = read_header(input)?;
     let guid = format_guid(&header.name);
 
-    let locdb = written_files
-        .iter()
-        .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("locdb")));
+    let locdb = written_files.iter().find(|p| {
+        p.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("locdb"))
+    });
 
     let (locdb_rel, mod_name) = match locdb {
         Some(path) => {
@@ -152,7 +302,10 @@ fn decode_reflect_file(path: &Path) -> Result<bool> {
 fn decode_rgd_files(written_files: &[PathBuf]) {
     let rgd_paths: Vec<&PathBuf> = written_files
         .iter()
-        .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rgd")))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rgd"))
+        })
         .collect();
     if rgd_paths.is_empty() {
         return;
@@ -165,7 +318,11 @@ fn decode_rgd_files(written_files: &[PathBuf]) {
             failed += 1;
         }
     }
-    println!("Decoded {} of {} .rgd files to xml", rgd_paths.len() - failed, rgd_paths.len());
+    println!(
+        "Decoded {} of {} .rgd files to xml",
+        rgd_paths.len() - failed,
+        rgd_paths.len()
+    );
 }
 
 fn decode_rgd_file(path: &Path) -> Result<()> {

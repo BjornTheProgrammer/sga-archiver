@@ -9,6 +9,7 @@ use anyhow::Result;
 mod archive;
 mod build;
 pub mod entries;
+mod index;
 /// Former name of [`entries`], kept so the rename is not a breaking change.
 #[deprecated(since = "0.2.1", note = "misspelling; use `entries`")]
 pub use crate::entries as entires;
@@ -16,10 +17,28 @@ pub mod localization;
 pub(crate) mod utils;
 
 pub use archive::{Archive, FileEntry, Folder, Toc, TocLayout};
+pub use index::{
+    ArchiveIndex, ArchiveReader, EncryptedMember, IndexFile, IndexFolder, IndexToc, Mismatch,
+    Verification,
+};
 
 pub fn read_header<P: AsRef<Path>>(sga_file: P) -> Result<entries::SgaHeader> {
     let mut sga_file = BufReader::new(File::open(sga_file)?);
     Ok(entries::SgaHeader::parse(&mut sga_file)?)
+}
+
+/// Opens an archive for on-demand member reads without loading its data.
+///
+/// The right entry point for listing or extracting from a large archive;
+/// [`read_archive`] is for callers that go on to write it back.
+pub fn open<P: AsRef<Path>>(sga_file: P) -> Result<ArchiveReader<BufReader<File>>> {
+    ArchiveReader::new(BufReader::new(File::open(sga_file)?))
+}
+
+/// Parses an archive's header and tables only.
+pub fn read_index<P: AsRef<Path>>(sga_file: P) -> Result<ArchiveIndex> {
+    let mut reader = BufReader::new(File::open(sga_file)?);
+    ArchiveIndex::read(&mut reader)
 }
 
 pub fn read_archive<P: AsRef<Path>>(sga_file: P) -> Result<Archive> {

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
-use binrw::{BinRead, BinWrite};
+use anyhow::{Context, Result, anyhow};
+use binrw::BinWrite;
 use brotli::Decompressor;
 use flate2::read::DeflateDecoder;
 use flate2::write::ZlibEncoder;
@@ -14,6 +14,7 @@ use crate::entries::{
     FileEncryptionType, FileStorageType, FileVerificationType, HeaderReserved, SgaFileEntry,
     SgaFolderEntry, SgaHeader, SgaToC,
 };
+use crate::index::{ArchiveIndex, EncryptedMember, IndexFolder};
 
 const MAIN_HEADER_SIZE: u64 = 428;
 const INDEX_TABLE_SIZE: usize = 44;
@@ -158,85 +159,89 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
+    /// The member's decoded bytes.
+    ///
+    /// An encrypted member is an [`EncryptedMember`] error: this crate does
+    /// not decrypt, and handing back the stored ciphertext as if it were the
+    /// member would let a caller write garbage without knowing.
     pub fn decoded(&self) -> Result<Vec<u8>> {
-        if self.encryption_type.is_encrypted() {
-            return Ok(self.stored_data.clone());
-        }
+        decode_stored(
+            &self.stored_data,
+            &self.storage_type,
+            &self.encryption_type,
+            self.uncompressed_size,
+            &self.name,
+        )
+    }
+}
 
-        match &self.storage_type {
-            FileStorageType::Store | FileStorageType::Unknown(_) => Ok(self.stored_data.clone()),
-            FileStorageType::StreamCompress | FileStorageType::BufferCompress => {
-                let mut cursor = Cursor::new(&self.stored_data);
-                cursor.seek(SeekFrom::Start(2))?;
-                let mut decoder = DeflateDecoder::new(cursor);
-                let mut out = vec![0u8; self.uncompressed_size as usize];
-                decoder.read_exact(&mut out)?;
-                Ok(out)
-            }
-            FileStorageType::StreamCompressBrotli | FileStorageType::BufferCompressBrotli => {
-                let cursor = Cursor::new(&self.stored_data);
-                let mut decoder = Decompressor::new(cursor, 4096);
-                let mut out = vec![0u8; self.uncompressed_size as usize];
-                decoder.read_exact(&mut out)?;
-                Ok(out)
-            }
+/// Decodes one member's stored bytes according to its storage and
+/// encryption types. The single decode path for the eager and lazy readers.
+pub(crate) fn decode_stored(
+    stored: &[u8],
+    storage: &FileStorageType,
+    encryption: &FileEncryptionType,
+    uncompressed_size: u32,
+    name: &str,
+) -> Result<Vec<u8>> {
+    if encryption.is_encrypted() {
+        return Err(EncryptedMember {
+            path: name.to_string(),
+            encryption: encryption.clone(),
+        }
+        .into());
+    }
+
+    match storage {
+        FileStorageType::Store | FileStorageType::Unknown(_) => Ok(stored.to_vec()),
+        FileStorageType::StreamCompress | FileStorageType::BufferCompress => {
+            let mut cursor = Cursor::new(stored);
+            cursor.seek(SeekFrom::Start(2))?;
+            let mut decoder = DeflateDecoder::new(cursor);
+            let mut out = vec![0u8; uncompressed_size as usize];
+            decoder
+                .read_exact(&mut out)
+                .with_context(|| format!("inflating {name}"))?;
+            Ok(out)
+        }
+        FileStorageType::StreamCompressBrotli | FileStorageType::BufferCompressBrotli => {
+            let cursor = Cursor::new(stored);
+            let mut decoder = Decompressor::new(cursor, 4096);
+            let mut out = vec![0u8; uncompressed_size as usize];
+            decoder
+                .read_exact(&mut out)
+                .with_context(|| format!("brotli-decoding {name}"))?;
+            Ok(out)
         }
     }
 }
 
 impl Archive {
     pub fn read<R: Read + BufRead + Seek>(reader: &mut R) -> Result<Archive> {
-        let header = SgaHeader::parse(reader).map_err(|e| anyhow!(e.to_string()))?;
-        let version = header.version;
+        let index = ArchiveIndex::read(reader)?;
+        Archive::from_index(reader, index)
+    }
 
-        reader.seek(SeekFrom::Start(
-            header.header_blob_offset + header.toc_data_offset as u64,
-        ))?;
-        let mut toc_entries = Vec::with_capacity(header.toc_data_count as usize);
-        for _ in 0..header.toc_data_count {
-            toc_entries.push(SgaToC::read_le_args(reader, (version,))?);
-        }
-
-        reader.seek(SeekFrom::Start(
-            header.header_blob_offset + header.folder_data_offset as u64,
-        ))?;
-        let mut folder_entries = Vec::with_capacity(header.folder_data_count as usize);
-        for _ in 0..header.folder_data_count {
-            folder_entries.push(SgaFolderEntry::read_le_args(reader, (version,))?);
-        }
-
-        reader.seek(SeekFrom::Start(
-            header.header_blob_offset + header.file_data_offset as u64,
-        ))?;
-        let mut file_entries = Vec::with_capacity(header.file_data_count as usize);
-        for _ in 0..header.file_data_count {
-            file_entries.push(SgaFileEntry::read_le_args(reader, (version,))?);
-        }
-
-        reader.seek(SeekFrom::Start(
-            header.header_blob_offset + header.string_offset as u64,
-        ))?;
-        let mut string_blob = vec![0u8; header.string_length as usize];
-        reader.read_exact(&mut string_blob)?;
-
-        let mut tocs = Vec::with_capacity(toc_entries.len());
-        for te in &toc_entries {
-            let root = build_folder(
-                reader,
-                &header,
-                &folder_entries,
-                &file_entries,
-                &string_blob,
-                te.folder_root_index as usize,
-                version,
-            )?;
+    /// Loads every member's bytes for an already parsed index.
+    pub fn from_index<R: Read + Seek>(reader: &mut R, index: ArchiveIndex) -> Result<Archive> {
+        let header = index.header;
+        let mut tocs = Vec::with_capacity(index.tocs.len());
+        for toc in index.tocs {
             tocs.push(Toc {
-                alias: trim_fixed(&te.alias),
-                name: trim_fixed(&te.name),
-                root,
+                alias: toc.alias,
+                name: toc.name,
+                root: load_folder(reader, toc.root)?,
             });
         }
 
+        let string_blob = {
+            reader.seek(SeekFrom::Start(
+                header.header_blob_offset + header.string_offset as u64,
+            ))?;
+            let mut blob = vec![0u8; header.string_length as usize];
+            reader.read_exact(&mut blob)?;
+            blob
+        };
         let layout = [TocLayout::Legacy, TocLayout::Modern]
             .into_iter()
             .find(|&layout| {
@@ -255,7 +260,7 @@ impl Archive {
         Ok(Archive {
             header_reserved: header.reserved.clone(),
             name: header.name.clone(),
-            version,
+            version: header.version,
             product: header.product,
             block_size: header.block_size,
             header_encryption_type: header.header_encryption_type.clone(),
@@ -876,7 +881,7 @@ fn append_str(blob: &mut Vec<u8>, value: &str) -> u32 {
 
 /// Depth-first pass building the string blob: each folder emits its full path,
 
-fn block_sha1(data: &[u8], block_size: usize) -> Vec<u8> {
+pub(crate) fn block_sha1(data: &[u8], block_size: usize) -> Vec<u8> {
     let block_size = block_size.max(1);
     let mut out = Vec::new();
     if data.is_empty() {
@@ -889,27 +894,6 @@ fn block_sha1(data: &[u8], block_size: usize) -> Vec<u8> {
     out
 }
 
-fn name_at(strings: &[u8], offset: usize) -> String {
-    let end = strings[offset..]
-        .iter()
-        .position(|&b| b == 0)
-        .map(|p| offset + p)
-        .unwrap_or(strings.len());
-    String::from_utf8_lossy(&strings[offset..end]).into_owned()
-}
-
-fn leaf_name(full: &str) -> String {
-    full.rsplit(|c| c == '\\' || c == '/')
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
-fn trim_fixed(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
-}
-
 fn to_fixed(value: &str) -> [u8; 64] {
     let mut out = [0u8; 64];
     let bytes = value.as_bytes();
@@ -918,84 +902,33 @@ fn to_fixed(value: &str) -> [u8; 64] {
     out
 }
 
-fn build_folder<R: Read + Seek>(
-    reader: &mut R,
-    header: &SgaHeader,
-    folders: &[SgaFolderEntry],
-    files: &[SgaFileEntry],
-    strings: &[u8],
-    index: usize,
-    version: u16,
-) -> Result<Folder> {
-    let entry = &folders[index];
-    let full = name_at(strings, entry.name_offset as usize);
-    let name = leaf_name(&full);
-
-    let mut file_nodes = Vec::new();
-    for i in entry.file_start_index..entry.file_end_index {
-        file_nodes.push(build_file(
-            reader,
-            header,
-            &files[i as usize],
-            strings,
-            version,
-        )?);
+fn load_folder<R: Read + Seek>(reader: &mut R, folder: IndexFolder) -> Result<Folder> {
+    let mut files = Vec::with_capacity(folder.files.len());
+    for file in folder.files {
+        reader.seek(SeekFrom::Start(file.data_offset))?;
+        let mut stored = vec![0u8; file.stored_size as usize];
+        reader
+            .read_exact(&mut stored)
+            .with_context(|| format!("reading stored bytes of {}", file.name))?;
+        files.push(FileEntry {
+            name: file.name,
+            stored_data: stored,
+            uncompressed_size: file.uncompressed_size,
+            storage_type: file.storage_type,
+            encryption_type: file.encryption_type,
+            verification_type: file.verification_type,
+            crc: file.crc,
+            data_order: Some(file.data_order),
+        });
     }
-
-    let mut folder_nodes = Vec::new();
-    for i in entry.folder_start_index..entry.folder_end_index {
-        folder_nodes.push(build_folder(
-            reader, header, folders, files, strings, i as usize, version,
-        )?);
+    let mut folders = Vec::with_capacity(folder.folders.len());
+    for child in folder.folders {
+        folders.push(load_folder(reader, child)?);
     }
-
     Ok(Folder {
-        name,
-        folders: folder_nodes,
-        files: file_nodes,
-    })
-}
-
-fn build_file<R: Read + Seek>(
-    reader: &mut R,
-    header: &SgaHeader,
-    entry: &SgaFileEntry,
-    strings: &[u8],
-    version: u16,
-) -> Result<FileEntry> {
-    let name = name_at(strings, entry.name_offset as usize);
-
-    reader.seek(SeekFrom::Start(header.data_offset + entry.data_offset))?;
-    let mut stored = vec![0u8; entry.compressed_length as usize];
-    reader.read_exact(&mut stored)?;
-
-    let (storage_type, encryption_type) = if version >= 10 {
-        (
-            FileStorageType::from_u8(entry.storage_byte & 0x0F),
-            FileEncryptionType::from_u8(entry.storage_byte >> 4),
-        )
-    } else {
-        (
-            FileStorageType::from_u8(entry.storage_byte),
-            FileEncryptionType::None,
-        )
-    };
-
-    let verification_type = if version >= 7 {
-        FileVerificationType::from_u8(entry.verification_byte)
-    } else {
-        FileVerificationType::None
-    };
-
-    Ok(FileEntry {
-        name,
-        stored_data: stored,
-        uncompressed_size: entry.uncompressed_size,
-        storage_type,
-        encryption_type,
-        verification_type,
-        crc: if version >= 6 { entry.crc } else { 0 },
-        data_order: Some(entry.data_offset),
+        name: folder.name,
+        folders,
+        files,
     })
 }
 

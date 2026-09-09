@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "relic-chunky"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "binrw",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "sga"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "binrw",
@@ -664,11 +664,12 @@ dependencies = [
 
 [[package]]
 name = "sga-archiver"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
  "relic-chunky",
+ "serde_json",
  "sga",
 ]
 

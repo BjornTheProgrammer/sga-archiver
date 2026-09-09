@@ -14,14 +14,26 @@ Click the releases tab, and then download and install the version you wish to us
 
 ## Usage
 
-Two commands:
+Two commands for people, and a set of JSON commands for other programs:
 
 ```
 Usage: sga-archiver <COMMAND>
 
 Commands:
-  pack    Compile a mod source directory into an .sga archive
-  unpack  Unpack an .sga archive into a directory
+  pack               Compile a mod source directory into an .sga archive
+  unpack             Unpack an .sga archive into a directory
+  inspect            Describe an archive and name its members, without reading their bytes (JSON)
+  list               List members with size, storage, encryption and verification details (JSON)
+  extract-member     Write one member's decoded bytes to a file (JSON)
+  extract            Write selected members under a directory, keeping their archive paths (JSON)
+  decode-rgd         Decode a compiled .rgd to XML (JSON)
+  patch-rgd-cstring  Replace every CString equal to OLD with NEW inside an .rgd (JSON)
+  patch-rgd-f32      Replace every Float under KEY equal to OLD with NEW inside an .rgd (JSON)
+  compile-project    Compile a mod source directory and describe the result (JSON)
+  repack             Read an archive and write it back (JSON)
+  graft              Copy members from a donor archive into a base archive (JSON)
+  graft-as           Copy donor members into a base archive under new paths (JSON)
+  replace-member     Replace one existing member's bytes with a file's contents (JSON)
 ```
 
 ### Unpack
@@ -56,6 +68,34 @@ Every artifact is **compiled directly from its source** — a mod tree needs no 
 Assets the tool can't yet compile (attributes `.rgd`, scenario formats) can still be supplied pre-burned under a `prebuilt/<toc>/<path>` directory and are packed as-is.
 
 SHA1 hashes are generated and the archive is written unencrypted.
+
+### Machine-readable commands
+
+Every command other than `pack` and `unpack` prints exactly one JSON object on
+stdout and nothing else. Each result carries `schema` (for example
+`sga-archiver.list/v1`) and `tool` (`{"name", "version"}`). On failure nothing
+is written to stdout, a message goes to stderr, and the exit code is nonzero.
+
+`inspect`, `list`, `extract-member` and `extract` read lazily: they parse the
+header and tables and touch only the member bytes they need, so they are the
+right way to look inside a multi-gigabyte base-game archive. `list --verify`
+additionally reads every member once and checks its stored bytes against the
+recorded CRC32 and SHA1 block hashes; it does not validate the header
+signature.
+
+```
+sga-archiver list Data.sga --filter .rrmaterial
+sga-archiver extract-member Data.sga art/house.rgm out/house.rgm
+sga-archiver extract Data.sga slot/ --filter .rrmaterial
+sga-archiver graft base.sga donor.sga out.sga art/custom.rgm
+```
+
+Members are named with `/` in results and accepted with either separator on
+the command line. Exact matches win; otherwise paths compare case-insensitively.
+
+Encrypted members are reported (`"encryption": "Aes128"`) but never decoded:
+`extract-member` fails on one, and `extract` lists them under `encrypted`
+instead of writing ciphertext. The crate does not decrypt.
 
 ```
 sga-archiver pack "./My Mod" -o out.sga

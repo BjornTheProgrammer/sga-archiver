@@ -1,12 +1,13 @@
+pub mod attrib;
 pub mod container;
-pub mod hash;
 pub mod decompile;
+pub mod hash;
+pub mod rdo;
+pub mod records;
 pub mod reflect_type;
 pub mod reflect_write;
-pub mod records;
-pub mod rdo;
 pub mod rgd;
+pub mod rgd_patch;
 pub mod rgd_write;
-pub mod attrib;
 pub mod schema_lib;
 pub mod texture;
