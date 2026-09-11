@@ -290,13 +290,17 @@ impl Archive {
 
         // Build the data blob. When every file preserves its original position
         // (a read→write round-trip), lay the files out in that order so the blob
-        let mut file_data_off: HashMap<(usize, String, String), u64> = HashMap::new();
-        let mut all_files: Vec<(usize, String, String, &FileEntry)> = Vec::new();
+        // Members are identified by their position in their folder, not by
+        // name: cooked archives legitimately carry two members with the same
+        // name in one folder (a texture and its packed variant), and keying
+        // by name would hand both entries the offset of whichever came last.
+        let mut file_data_off: HashMap<(usize, String, usize), u64> = HashMap::new();
+        let mut all_files: Vec<(usize, String, usize, &FileEntry)> = Vec::new();
         for (ti, toc) in self.tocs.iter().enumerate() {
             for event in walk(self.layout, &toc.root) {
                 if let WalkEvent::Visit(full, folder) = event {
-                    for file in &folder.files {
-                        all_files.push((ti, full.clone(), file.name.clone(), file));
+                    for (fi, file) in folder.files.iter().enumerate() {
+                        all_files.push((ti, full.clone(), fi, file));
                     }
                 }
             }
@@ -304,8 +308,8 @@ impl Archive {
         if all_files.iter().all(|(_, _, _, f)| f.data_order.is_some()) {
             all_files.sort_by_key(|(_, _, _, f)| f.data_order.unwrap());
         }
-        for (ti, full, name, file) in &all_files {
-            file_data_off.insert((*ti, full.clone(), name.clone()), data_blob.len() as u64);
+        for (ti, full, fi, file) in &all_files {
+            file_data_off.insert((*ti, full.clone(), *fi), data_blob.len() as u64);
             data_blob.extend_from_slice(&file.stored_data);
         }
 
@@ -324,14 +328,12 @@ impl Archive {
                     continue;
                 };
                 let folder_start = file_entries.len() as u32;
-                for file in &folder.files {
-                    let key = (ti, full.clone(), file.name.clone());
+                for (fi, file) in folder.files.iter().enumerate() {
                     push_file_entry(
                         file,
-                        &key,
+                        file_str[&(ti, full.clone(), file.name.clone())],
+                        file_data_off[&(ti, full.clone(), fi)],
                         &mut file_entries,
-                        &file_str,
-                        &file_data_off,
                         &mut hash_blob,
                         block_size,
                     );
@@ -884,10 +886,9 @@ fn build_strings(
 
 fn push_file_entry(
     file: &FileEntry,
-    key: &(usize, String, String),
+    name_offset: u32,
+    data_offset: u64,
     file_entries: &mut Vec<SgaFileEntry>,
-    file_str: &HashMap<(usize, String, String), u32>,
-    file_data_off: &HashMap<(usize, String, String), u64>,
     hash_blob: &mut Vec<u8>,
     block_size: usize,
 ) {
@@ -899,9 +900,9 @@ fn push_file_entry(
         hash_blob.len() as u32
     };
     file_entries.push(SgaFileEntry {
-        name_offset: file_str[key],
+        name_offset,
         hash_offset: hash_off,
-        data_offset: file_data_off[key],
+        data_offset,
         compressed_length: file.stored_data.len() as u32,
         uncompressed_size: file.uncompressed_size,
         unknown: 0,

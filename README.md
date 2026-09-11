@@ -93,10 +93,6 @@ sga-archiver graft base.sga donor.sga out.sga art/custom.rgm
 Members are named with `/` in results and accepted with either separator on
 the command line. Exact matches win; otherwise paths compare case-insensitively.
 
-Encrypted members are reported (`"encryption": "Aes128"`) but never decoded:
-`extract-member` fails on one, and `extract` lists them under `encrypted`
-instead of writing ciphertext. The crate does not decrypt.
-
 ```
 sga-archiver pack "./My Mod" -o out.sga
 ```
