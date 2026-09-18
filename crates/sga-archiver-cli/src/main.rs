@@ -131,6 +131,16 @@ enum Command {
         output: PathBuf,
         member: String,
     },
+    /// Add a new member from a file's contents; the member need not exist (JSON).
+    AddMember {
+        base: PathBuf,
+        payload: PathBuf,
+        output: PathBuf,
+        member: String,
+        /// TOC alias to route into; defaults to an existing member's TOC.
+        #[arg(long)]
+        alias: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -200,6 +210,13 @@ fn main() -> Result<()> {
             output,
             member,
         } => machine::replace_member(&base, &payload, &output, &member)?,
+        Command::AddMember {
+            base,
+            payload,
+            output,
+            member,
+            alias,
+        } => machine::add_member(&base, &payload, &output, &member, alias.as_deref())?,
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())

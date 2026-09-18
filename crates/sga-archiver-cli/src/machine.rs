@@ -587,6 +587,51 @@ pub fn replace_member(base: &Path, payload: &Path, output: &Path, member: &str) 
     ))
 }
 
+/// Add a new member from a file's contents. Unlike `replace-member`, the member
+/// need not already exist. Routes into `--alias`'s TOC when given, otherwise
+/// reuses an existing member's TOC (falling back to a `data` TOC), creating it
+/// if it is missing.
+pub fn add_member(
+    base: &Path,
+    payload: &Path,
+    output: &Path,
+    member: &str,
+    alias: Option<&str>,
+) -> Result<Value> {
+    if member.trim().is_empty() {
+        bail!("archive member must not be empty");
+    }
+    if base == output || payload == output {
+        bail!("output must differ from both input files");
+    }
+    refuse_existing(output)?;
+    let mut archive = read_eager(base, "base")?;
+    let toc_alias = match alias {
+        Some(a) if !a.trim().is_empty() => a.to_string(),
+        _ => archive
+            .files()
+            .next()
+            .map(|(toc, _, _)| toc.alias.clone())
+            .unwrap_or_else(|| "data".to_string()),
+    };
+    let data = fs::read(payload)
+        .with_context(|| format!("failed to read payload {}", payload.display()))?;
+    let size = data.len();
+    archive.upsert_stored_in(&toc_alias, member, data);
+    write_eager(&mut archive, output)?;
+    Ok(envelope(
+        "add-member",
+        json!({
+            "base": base,
+            "payload": {"path": payload, "size": size},
+            "output": output,
+            "added_member": member,
+            "toc_alias": toc_alias,
+            "archive": archive_summary(&archive),
+        }),
+    ))
+}
+
 /// Parses `source=target` pairs for `graft-as`.
 pub fn parse_mappings(values: &[String]) -> Result<Vec<(String, String)>> {
     values
