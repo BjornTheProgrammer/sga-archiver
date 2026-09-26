@@ -632,6 +632,65 @@ pub fn add_member(
     ))
 }
 
+/// Set many members from files in one write. `list` holds one `member=payload`
+/// line per member (blank lines ignored; a relative payload is read beside the
+/// list). A member that exists keeps its TOC; a new one goes into `alias`'s TOC,
+/// which is required as soon as any member is new.
+pub fn set_members(base: &Path, list: &Path, output: &Path, alias: Option<&str>) -> Result<Value> {
+    if base == output || list == output {
+        bail!("output must differ from both input files");
+    }
+    refuse_existing(output)?;
+    let text = fs::read_to_string(list)
+        .with_context(|| format!("failed to read member list {}", list.display()))?;
+    let folder = list.parent().unwrap_or_else(|| Path::new("."));
+    let entries = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.split_once('=')
+                .filter(|(member, payload)| !member.trim().is_empty() && !payload.trim().is_empty())
+                .map(|(member, payload)| (member.trim().to_owned(), folder.join(payload.trim())))
+                .with_context(|| format!("invalid member list line: {line}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if entries.is_empty() {
+        bail!("the member list names no members");
+    }
+    let mut archive = read_eager(base, "base")?;
+    let mut added = 0;
+    for (member, payload) in &entries {
+        let toc_alias = match member_toc_alias(&archive, member) {
+            Ok(existing) => existing,
+            Err(_) => {
+                added += 1;
+                alias
+                    .filter(|a| !a.trim().is_empty())
+                    .with_context(|| {
+                        format!("{member} is new to the archive; name its TOC with --alias")
+                    })?
+                    .to_string()
+            }
+        };
+        let data = fs::read(payload)
+            .with_context(|| format!("failed to read payload {}", payload.display()))?;
+        archive.upsert_stored_in(&toc_alias, member, data);
+    }
+    write_eager(&mut archive, output)?;
+    Ok(envelope(
+        "set-members",
+        json!({
+            "base": base,
+            "list": list,
+            "output": output,
+            "set_members": entries.len(),
+            "added_members": added,
+            "archive": archive_summary(&archive),
+        }),
+    ))
+}
+
 /// Parses `source=target` pairs for `graft-as`.
 pub fn parse_mappings(values: &[String]) -> Result<Vec<(String, String)>> {
     values

@@ -508,6 +508,71 @@ fn repack_graft_replace_round_trip() {
 }
 
 #[test]
+fn set_members_replaces_and_adds_in_one_write() {
+    let sandbox = Sandbox::new("set");
+    let base = sandbox.path("base.sga");
+    base_archive(&base);
+    fs::create_dir_all(sandbox.path("payloads")).unwrap();
+    fs::write(sandbox.path("payloads/main.scar"), b"-- replaced").unwrap();
+    fs::write(sandbox.path("payloads/new.rgd"), b"new blueprint").unwrap();
+    let list = sandbox.path("members.txt");
+    fs::write(
+        &list,
+        "scar/main.scar=payloads/main.scar\n\nattrib/ebps/mod/new.rgd = payloads/new.rgd\n",
+    )
+    .unwrap();
+
+    let output = sandbox.path("set.sga");
+    let value = ok(&[
+        "set-members",
+        &s(&base),
+        &s(&list),
+        &s(&output),
+        "--alias",
+        "attrib",
+    ]);
+    assert_eq!(value["schema"], "sga-archiver.set-members/v1");
+    assert_eq!(value["set_members"], 2);
+    assert_eq!(value["added_members"], 1);
+    let members = member_paths(&value["archive"]["members"]);
+    assert!(
+        members.contains(&"data:scar/main.scar".to_string()),
+        "{members:?}"
+    );
+    assert!(
+        members.contains(&"attrib:attrib/ebps/mod/new.rgd".to_string()),
+        "{members:?}"
+    );
+    let archive = Archive::read(&mut std::io::BufReader::new(
+        fs::File::open(&output).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(member(&archive, "scar/main.scar"), b"-- replaced");
+    assert_eq!(
+        member(&archive, "attrib/ebps/mod/new.rgd"),
+        b"new blueprint"
+    );
+    assert_eq!(member(&archive, "art/house.rrmaterial"), b"material");
+
+    // A new member needs a TOC to go into.
+    let stderr = fails(&[
+        "set-members",
+        &s(&base),
+        &s(&list),
+        &s(&sandbox.path("bad.sga")),
+    ]);
+    assert!(stderr.contains("--alias"), "{stderr}");
+    fs::write(&list, "no-equals\n").unwrap();
+    let stderr = fails(&[
+        "set-members",
+        &s(&base),
+        &s(&list),
+        &s(&sandbox.path("bad2.sga")),
+    ]);
+    assert!(stderr.contains("invalid member list line"), "{stderr}");
+}
+
+#[test]
 fn failures_leave_stdout_empty() {
     let sandbox = Sandbox::new("fail");
     let stderr = fails(&["inspect", &s(&sandbox.path("missing.sga"))]);

@@ -141,6 +141,15 @@ enum Command {
         #[arg(long)]
         alias: Option<String>,
     },
+    /// Set many members from files in one write; LIST holds `member=payload` lines (JSON).
+    SetMembers {
+        base: PathBuf,
+        list: PathBuf,
+        output: PathBuf,
+        /// TOC alias for members new to the archive.
+        #[arg(long)]
+        alias: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -217,6 +226,12 @@ fn main() -> Result<()> {
             member,
             alias,
         } => machine::add_member(&base, &payload, &output, &member, alias.as_deref())?,
+        Command::SetMembers {
+            base,
+            list,
+            output,
+            alias,
+        } => machine::set_members(&base, &list, &output, alias.as_deref())?,
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
